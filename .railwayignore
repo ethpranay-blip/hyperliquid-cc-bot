@@ -1,0 +1,67 @@
+# Exclude sensitive and ephemeral files from Railway deployment
+# Similar to .gitignore but specifically for Railway builds
+
+# Sensitive - never deploy these
+.env
+.env.local
+*.key
+
+# Data directory (will be on persistent volume instead)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Logs (generated at runtime)
+*.log
+*.log.*
+/tmp/
+
+# Process control
+.bot.pid
+
+# Development and testing
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Documentation and examples (optional - comment out if you want these deployed)
+# README.md
+# GAMEPLAN.md
+# docs/
+# examples/
+
+# Diagnostic and helper scripts (not needed in production)
+diagnostics_check.py
+debug_events.py
+check_dedup_state.py
+check_pending.py
+cleanup_stale_trades.py
+DIAGNOSTIC_SUMMARY.md
+
+# Claude Code memory (not needed in deployment)
+.claude/

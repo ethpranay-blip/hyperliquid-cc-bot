@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 install:*)",
+      "Bash(python3 -m app.main)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:8080/)",
+      "Bash(kill 94323)",
+      "Bash(kill 99832)",
+      "Bash(/usr/bin/curl --version)",
+      "Bash(pkill -f \"python.*app.main\")",
+      "Bash(kill 1021)",
+      "Bash(kill 3794)",
+      "Bash(python diagnostics_check.py)",
+      "Bash(python3 diagnostics_check.py)",
+      "Bash(/Library/Developer/CommandLineTools/usr/bin/python3 diagnostics_check.py)",
+      "Bash(make status *)",
+      "Bash(ps -p 63734 -o lstart=)",
+      "Bash(/Library/Developer/CommandLineTools/usr/bin/python3 debug_events.py)",
+      "Bash(/Library/Developer/CommandLineTools/usr/bin/python3 check_dedup_state.py)",
+      "Bash(/Library/Developer/CommandLineTools/usr/bin/python3 cleanup_stale_trades.py)",
+      "Bash(make restart *)",
+      "Bash(/Library/Developer/CommandLineTools/usr/bin/python3 check_pending.py)",
+      "Bash(chmod +x validate_railway_setup.sh)",
+      "Bash(./validate_railway_setup.sh)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "claude-flow"
+  ]
+}

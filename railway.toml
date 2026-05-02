@@ -1,0 +1,43 @@
+# Railway Deployment Configuration for Corgi Copy Trading Bot
+# Docs: https://docs.railway.app/reference/config-as-code
+
+[build]
+builder = "NIXPACKS"
+nixpacksConfigPath = "nixpacks.toml"
+
+[deploy]
+startCommand = "python -m app.main"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# Health check on the NiceGUI dashboard
+healthcheckPath = "/"
+healthcheckTimeout = 300
+
+# Railway will send SIGTERM for graceful shutdown, wait 10s, then SIGKILL
+# The bot's on_shutdown handlers in main.py will close connections cleanly
+[deploy.gracefulShutdown]
+enabled = true
+timeoutSeconds = 10
+
+# Volume mount for persistent data (database, logs)
+# Create a volume in Railway dashboard and mount it to /data
+# Set RAILWAY_VOLUME_MOUNT_PATH=/data in Railway environment variables
+[[deploy.volumes]]
+mountPath = "/data"
+# Volume name is set in Railway dashboard when you create the volume
+
+[deploy.env]
+# These are defaults - override in Railway dashboard
+DRY_RUN = "true"
+LOG_LEVEL = "INFO"
+HL_LEVERAGE = "10"
+HL_MARGIN_USD = "100"
+HL_MARGIN_MODE = "isolated"
+RECONCILE_INTERVAL_SECONDS = "60"
+HL_CHANGE_DEBOUNCE_SECONDS = "2.0"
+ALLOWED_CALLERS = "voberoi,pranayyyy,corgil_"
+HL_DEX_PRIORITY = "xyz,cash,flx"
+
+# Database path will use the volume mount
+# CORGI_DB_PATH will be set to ${RAILWAY_VOLUME_MOUNT_PATH}/corgi.db in the start script

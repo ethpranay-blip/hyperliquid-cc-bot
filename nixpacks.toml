@@ -1,0 +1,14 @@
+# Nixpacks build configuration for Railway
+# Ensures correct Python version and dependencies are installed
+
+[phases.setup]
+nixPkgs = ["python39", "gcc"]
+
+[phases.install]
+cmds = ["pip install --upgrade pip", "pip install -r requirements.txt"]
+
+[phases.build]
+# No build step needed for this project
+
+[start]
+cmd = "python3 -m app.main"
