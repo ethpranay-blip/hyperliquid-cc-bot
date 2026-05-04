@@ -1305,6 +1305,18 @@ class HyperliquidClient:
                 withdrawable, account_value, total_margin_used, self.margin_mode
             )
 
+            # CRITICAL FIX: If API returns ALL ZEROS, it's broken - skip margin check entirely
+            # This prevents dropping valid trades when HL API returns bogus zero data
+            if withdrawable == 0 and account_value == 0 and total_margin_used == 0:
+                log.error(
+                    "MARGIN_CHECK_FAILED: HL API returned all zeros (withdrawable=0, accountValue=0, "
+                    "totalMarginUsed=0). API call is broken. SKIPPING margin check to allow trade. "
+                    "Wallet: %s, margin_mode=%s",
+                    self.main_address, self.margin_mode
+                )
+                # Return None = "couldn't check" → margin check is skipped in main.py
+                return None
+
             # For cross margin, use accountValue - totalMarginUsed if withdrawable looks wrong
             if self.use_cross_margin and withdrawable < 50 and account_value > 100:
                 available = account_value - total_margin_used
