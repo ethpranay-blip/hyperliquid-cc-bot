@@ -2,19 +2,11 @@
 
 ## ✅ Files Created
 
-All Railway deployment configuration files have been created and validated:
+Railway deployment configuration files (final working setup):
 
-### 1. `railway.toml` ✓
-Railway deployment configuration with:
-- Build settings (Nixpacks builder)
-- Start command: `python -m app.main`
-- Auto-restart policy: ON_FAILURE (max 10 retries)
-- Health check on `/` (dashboard homepage)
-- Graceful shutdown: 10 seconds for cleanup
-- Volume mount configuration for `/data`
-- Default environment variables
+**NOTE:** Initial attempts used `railway.toml` and `nixpacks.toml` but those caused build failures. Final deployment uses Railway's **auto-detection** with just `Procfile` + `requirements.txt`.
 
-### 2. `Procfile` ✓
+### 1. `Procfile` ✓
 Process definition for Railway:
 ```
 web: python3 -m app.main
@@ -26,7 +18,7 @@ Railway will:
 - Handle auto-restart on crash
 - Send SIGTERM for graceful shutdown
 
-### 3. `.railwayignore` ✓
+### 2. `.railwayignore` ✓
 Excludes from deployment:
 - `.env` and sensitive files
 - `data/` directory (uses volume instead)
@@ -37,14 +29,7 @@ Excludes from deployment:
 - Diagnostic scripts (not needed in production)
 - `.claude/` directory
 
-### 4. `nixpacks.toml` ✓
-Build configuration:
-- Python 3.9 runtime
-- GCC for native dependencies
-- Pip dependency installation
-- Start command
-
-### 5. `env.example` - Updated ✓
+### 3. `env.example` - Updated ✓
 Added Railway-specific section:
 ```bash
 # === Railway Deployment ===
@@ -54,7 +39,7 @@ CORGI_DB_PATH=${RAILWAY_VOLUME_MOUNT_PATH}/corgi.db
 
 With detailed setup instructions for volume mounting.
 
-### 6. `RAILWAY_DEPLOYMENT.md` ✓
+### 4. `RAILWAY_DEPLOYMENT.md` ✓
 Comprehensive deployment guide covering:
 - Quick deploy steps
 - Volume setup (critical!)
@@ -65,7 +50,7 @@ Comprehensive deployment guide covering:
 - Production checklist
 - Cost estimates
 
-### 7. `validate_railway_setup.sh` ✓
+### 5. `validate_railway_setup.sh` ✓
 Validation script that checks:
 - All required files present
 - Procfile has correct start command
@@ -114,21 +99,34 @@ Run before deploying:
    - Check logs: Deployments → View Logs
    - Access dashboard: Settings → Networking → Generate Domain
 
-## 📋 Validation Results
+## 📋 Deployment Evolution
+
+**Initial Approach (Failed 4 times):**
+- Tried custom `railway.toml` + `nixpacks.toml` configurations
+- Build failures: python39 missing pip, ensurepip errors, format incompatibilities
+- Commits: 5550664 → 3b55d08 (all deleted in final version)
+
+**Final Working Approach:**
+- Deleted both `railway.toml` and `nixpacks.toml`
+- Railway auto-detects Python from `requirements.txt` + `Procfile`
+- Build succeeded immediately ✅
+- Deployed successfully on May 4, 2026
+
+## 📋 Validation Results (Final State)
 
 ```
-✓ railway.toml exists
 ✓ Procfile exists and has correct start command
 ✓ .railwayignore exists and excludes .env
-✓ nixpacks.toml exists
 ✓ requirements.txt exists with all dependencies
 ✓ env.example exists (reference for Railway vars)
 ✓ .gitignore excludes .env
 ✓ app/ directory and all modules exist
+✓ Volume mounted to /data
+✓ All environment variables configured
 
-⚠ 1 Warning: .env exists locally (expected for dev, won't be deployed)
+⚠ Note: railway.toml and nixpacks.toml were removed (auto-detect works better)
 
-Result: READY TO DEPLOY! 🚀
+Result: DEPLOYED AND RUNNING! 🚀
 ```
 
 ## 🔒 Security Checklist
@@ -169,31 +167,32 @@ Unlike local deployment with `run_forever.sh`, Railway provides:
    - Easy updates without code changes
    - Automatic injection at runtime
 
-## 🎯 Next Steps
+## 🎯 Deployment Status (Updated May 4, 2026)
 
-1. **Pre-deployment:**
-   - [ ] Run `./validate_railway_setup.sh`
-   - [ ] Review `RAILWAY_DEPLOYMENT.md`
-   - [ ] Prepare environment variables (use `env.example` as reference)
+1. **Pre-deployment:** ✅ COMPLETE
+   - [x] Ran `./validate_railway_setup.sh`
+   - [x] Reviewed `RAILWAY_DEPLOYMENT.md`
+   - [x] Prepared environment variables
 
-2. **Initial Deploy:**
-   - [ ] Create Railway project from GitHub repo
-   - [ ] Add volume and mount to `/data`
-   - [ ] Set all required environment variables
-   - [ ] Start with `DRY_RUN=true`
-   - [ ] Check logs for successful startup
+2. **Initial Deploy:** ✅ COMPLETE
+   - [x] Created Railway project from GitHub repo (ethpranay-blip/hyperliquid-cc-bot)
+   - [x] Added volume mounted to `/data`
+   - [x] Set all required environment variables (HL_MARGIN_USD=50, HL_WALLET_ADDRESS, etc.)
+   - [x] Deployed successfully (after auto-detect pivot)
+   - [x] Verified logs show successful startup
 
-3. **Testing:**
-   - [ ] Verify dashboard is accessible
-   - [ ] Wait for a whitelisted caller's new trade
-   - [ ] Check logs for `routing event:` and `handle_new_trade:` lines
-   - [ ] Verify STALE trades show correctly
+3. **Testing:** ⏳ IN PROGRESS
+   - [x] Dashboard is accessible (public Railway URL)
+   - [x] STALE trades display correctly (#685-688 marked as STALE)
+   - [ ] **NEXT:** Wait for fresh whitelisted trade to test end-to-end
+   - [ ] Verify margin check works (redeploy fixed $16.60 issue)
+   - [ ] Confirm position opens on HL mainnet
 
-4. **Production:**
-   - [ ] Set `DRY_RUN=false` when confident
-   - [ ] Monitor first few real trades closely
-   - [ ] Set up notifications (`NOTIFY_WEBHOOK_URL`)
-   - [ ] Configure backup strategy
+4. **Production:** 🔜 PENDING
+   - [x] `DRY_RUN=false` already set (real trading enabled)
+   - [ ] Monitor first real trade closely
+   - [ ] Set up notifications (`NOTIFY_WEBHOOK_URL` optional)
+   - [ ] Local bot permanently stopped ✅
 
 ## 📚 Documentation
 
