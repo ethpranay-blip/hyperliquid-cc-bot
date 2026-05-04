@@ -3,7 +3,7 @@
 
 [build]
 builder = "NIXPACKS"
-nixpacksConfigPath = "nixpacks.toml"
+# Railway auto-detects Python from requirements.txt - no custom config needed
 
 [deploy]
 startCommand = "python -m app.main"
