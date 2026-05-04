@@ -1270,64 +1270,58 @@ class HyperliquidClient:
     async def get_available_margin(self) -> Optional[float]:
         """Return USDC available as initial margin for new perp positions.
 
-        On HyperCore unified accounts (cross or isolated), `withdrawable`
-        from clearinghouseState is the right field — it's the amount you
-        can deploy as initial margin without disrupting existing positions
-        or exceeding maintenance buffer.
+        For UNIFIED ACCOUNTS (Hyperliquid's default), must query spot_user_state()
+        instead of user_state(). From HL docs:
+        "For API users, unified account and portfolio margin shows all balances
+        and holds in the spot clearinghouse state. Individual perp dex user
+        states are not meaningful."
 
+        Returns USDC total - hold from spot state.
         Returns None on query failure so callers can distinguish "really 0"
         from "couldn't tell" — same defensive contract as open_positions().
         """
         if self.dry_run or self._info is None or not self.main_address:
             return None
-        def _call():
-            return self._info.user_state(self.main_address)
+
+        # For unified accounts, query spot_user_state instead of user_state
+        def _call_spot():
+            return self._info.spot_user_state(self.main_address)
+
         try:
-            state = await asyncio.to_thread(_call)
+            spot_state = await asyncio.to_thread(_call_spot)
         except Exception as exc:
-            log.warning("get_available_margin: user_state failed: %s", exc)
-            return None
-        if not isinstance(state, dict):
+            log.warning("get_available_margin: spot_user_state failed: %s", exc)
             return None
 
-        # DEBUG: Log full state to diagnose margin detection issue
-        log.info("MARGIN_CHECK_DEBUG wallet=%s state=%s", self.main_address, json.dumps(state, indent=2))
+        if not isinstance(spot_state, dict):
+            log.warning("get_available_margin: spot_user_state returned non-dict: %s", type(spot_state))
+            return None
+
+        # Parse balances array to find USDC
+        balances = spot_state.get("balances", [])
+        usdc_balance = None
+
+        for bal in balances:
+            if bal.get("coin") == "USDC":
+                usdc_balance = bal
+                break
+
+        if not usdc_balance:
+            log.warning("get_available_margin: USDC not found in spot balances")
+            return None
 
         try:
-            withdrawable = float(state.get("withdrawable") or 0)
-            # Also check marginSummary for cross margin accounts
-            margin_summary = state.get("marginSummary", {})
-            account_value = float(margin_summary.get("accountValue") or 0)
-            total_margin_used = float(margin_summary.get("totalMarginUsed") or 0)
+            total = float(usdc_balance.get("total") or 0)
+            hold = float(usdc_balance.get("hold") or 0)
+            available = total - hold
 
             log.info(
-                "MARGIN_CHECK_DEBUG withdrawable=%.2f accountValue=%.2f totalMarginUsed=%.2f margin_mode=%s",
-                withdrawable, account_value, total_margin_used, self.margin_mode
+                "MARGIN_CHECK (unified account): USDC total=%.2f hold=%.2f available=%.2f wallet=%s",
+                total, hold, available, self.main_address
             )
 
-            # CRITICAL FIX: If API returns ALL ZEROS, it's broken - skip margin check entirely
-            # This prevents dropping valid trades when HL API returns bogus zero data
-            if withdrawable == 0 and account_value == 0 and total_margin_used == 0:
-                log.error(
-                    "MARGIN_CHECK_FAILED: HL API returned all zeros (withdrawable=0, accountValue=0, "
-                    "totalMarginUsed=0). API call is broken. SKIPPING margin check to allow trade. "
-                    "Wallet: %s, margin_mode=%s",
-                    self.main_address, self.margin_mode
-                )
-                # Return None = "couldn't check" → margin check is skipped in main.py
-                return None
+            return max(0, available)
 
-            # For cross margin, use accountValue - totalMarginUsed if withdrawable looks wrong
-            if self.use_cross_margin and withdrawable < 50 and account_value > 100:
-                available = account_value - total_margin_used
-                log.warning(
-                    "MARGIN_FIX: Cross margin account, withdrawable=$%.2f looks wrong, "
-                    "using accountValue($%.2f) - totalMarginUsed($%.2f) = $%.2f",
-                    withdrawable, account_value, total_margin_used, available
-                )
-                return max(0, available)
-
-            return withdrawable
         except (ValueError, TypeError) as exc:
             log.warning("get_available_margin: field parsing failed: %s", exc)
             return None
