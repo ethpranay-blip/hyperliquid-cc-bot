@@ -2,7 +2,7 @@
 # Docs: https://nixpacks.com/docs/configuration/file
 
 [phases.setup]
-nixPkgs = ["python39", "gcc", "libffi", "openssl"]
+nixPkgs = ["python39Full", "gcc", "libffi", "openssl"]
 
 [phases.install]
 cmds = [
