@@ -1289,9 +1289,35 @@ class HyperliquidClient:
             return None
         if not isinstance(state, dict):
             return None
+
+        # DEBUG: Log full state to diagnose margin detection issue
+        log.info("MARGIN_CHECK_DEBUG wallet=%s state=%s", self.main_address, json.dumps(state, indent=2))
+
         try:
-            return float(state.get("withdrawable") or 0)
-        except (ValueError, TypeError):
+            withdrawable = float(state.get("withdrawable") or 0)
+            # Also check marginSummary for cross margin accounts
+            margin_summary = state.get("marginSummary", {})
+            account_value = float(margin_summary.get("accountValue") or 0)
+            total_margin_used = float(margin_summary.get("totalMarginUsed") or 0)
+
+            log.info(
+                "MARGIN_CHECK_DEBUG withdrawable=%.2f accountValue=%.2f totalMarginUsed=%.2f margin_mode=%s",
+                withdrawable, account_value, total_margin_used, self.margin_mode
+            )
+
+            # For cross margin, use accountValue - totalMarginUsed if withdrawable looks wrong
+            if self.use_cross_margin and withdrawable < 50 and account_value > 100:
+                available = account_value - total_margin_used
+                log.warning(
+                    "MARGIN_FIX: Cross margin account, withdrawable=$%.2f looks wrong, "
+                    "using accountValue($%.2f) - totalMarginUsed($%.2f) = $%.2f",
+                    withdrawable, account_value, total_margin_used, available
+                )
+                return max(0, available)
+
+            return withdrawable
+        except (ValueError, TypeError) as exc:
+            log.warning("get_available_margin: field parsing failed: %s", exc)
             return None
 
     async def open_positions(self) -> Optional[list[dict]]:
