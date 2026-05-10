@@ -521,6 +521,29 @@ def insert_tp_update(
     return int(cur.lastrowid)
 
 
+def get_tp_price_from_history(trade_id: int, tp_num: int) -> Optional[float]:
+    """Return the most recent recorded tp_price for (trade_id, tp_num).
+
+    Used by main._auto_trail_stop_after_tp to look up TP1/TP2 prices when a
+    later TP hits, because hl_opened_trades does not persist TP levels.
+    Rows with tp_price <= 0 are filtered out — `insert_tp_update` falls back
+    to 0.0 when both the portal `tp_price` and HL `avg_exit_price` are null,
+    and trailing the SL to 0 would be catastrophic for a long position.
+
+    Returns None if no qualifying row exists.
+    """
+    row = _execute(
+        """
+        SELECT tp_price FROM hl_tp_updates
+        WHERE trade_id = ? AND tp_num = ? AND tp_price > 0
+        ORDER BY id DESC
+        LIMIT 1;
+        """,
+        (int(trade_id), int(tp_num)),
+    ).fetchone()
+    return float(row["tp_price"]) if row is not None else None
+
+
 # ============================================================
 # SECTION: portal_events
 # ============================================================
