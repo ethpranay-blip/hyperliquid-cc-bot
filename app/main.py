@@ -346,6 +346,78 @@ async def handle_new_trade(event: dict) -> None:
         await enter_trade(trade_id)
 
 
+async def _auto_trail_stop_after_tp(
+    trade_id: int, coin: str, side: str, tp_num: Optional[int], opened: dict
+) -> None:
+    """
+    Automatically trail stop after TP hit per Corgi Calls rules:
+    - TP1 hit → Move stop to entry (BE)
+    - TP2 hit → Keep stop at entry (BE)
+    - TP3 hit → Move stop to TP1 price
+    - TP4 hit → Move stop to TP2 price
+    """
+    if tp_num is None or state.hl is None:
+        return
+
+    entry = opened.get("entry_price")
+    if entry is None:
+        return
+
+    # Determine new stop based on TP number
+    new_stop = None
+
+    if tp_num in (1, 2):
+        # TP1 or TP2 hit → move to breakeven
+        new_stop = float(entry)
+        reason = f"TP{tp_num} hit → BE"
+
+    elif tp_num == 3:
+        # TP3 hit → move to TP1 price
+        tp1_price = opened.get("tp1")
+        if tp1_price is not None:
+            new_stop = float(tp1_price)
+            reason = "TP3 hit → TP1"
+
+    elif tp_num == 4:
+        # TP4 hit → move to TP2 price
+        tp2_price = opened.get("tp2")
+        if tp2_price is not None:
+            new_stop = float(tp2_price)
+            reason = "TP4 hit → TP2"
+
+    if new_stop is None:
+        return
+
+    # Update stop on Hyperliquid
+    try:
+        log.info(
+            "AUTO TRAILING STOP: #%s %s - %s (new_stop=%.4f)",
+            trade_id, coin, reason, new_stop
+        )
+
+        await state.hl.update_stop(
+            trade_id=trade_id, portal_coin=coin, side=side,
+            new_portal_stop=new_stop, portal_entry=float(entry),
+        )
+
+        db.insert_sl_update(
+            trade_id=trade_id,
+            old_stop=opened.get("entry_sl"),
+            new_stop=new_stop,
+        )
+
+        _push_activity(
+            "stop_update",
+            f"🔒 AUTO SL→{_fmt_price(new_stop)} {coin} #{trade_id} ({reason})",
+            trade_id
+        )
+
+        log.info("AUTO TRAILING: SL updated #%s → %.4f (%s)", trade_id, new_stop, reason)
+
+    except Exception:
+        log.exception("AUTO TRAILING: update_stop failed #%s", trade_id)
+
+
 async def handle_stop_update(event: dict) -> None:
     trade_id = event.get("trade_id")
     new_stop = event.get("new_stop")
@@ -430,6 +502,14 @@ async def handle_tp_hit(event: dict) -> None:
                 size_pct=float(size_pct), tp_num=tp_num,
                 trade_id=int(trade_id), dry_run=state.dry_run,
             )
+
+            # CRITICAL: Automatic trailing stop after TP hit
+            # Corgi Calls rules: TP1/TP2 → BE, TP3 → TP1, TP4 → TP2
+            await _auto_trail_stop_after_tp(
+                trade_id=int(trade_id), coin=coin, side=side,
+                tp_num=tp_num, opened=opened
+            )
+
     except HyperliquidValidationError as exc:
         log.warning("TP execution rejected #%s: %s", trade_id, exc)
     except Exception:
