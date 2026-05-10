@@ -32,6 +32,12 @@ See [docs/SYSTEMS.md](docs/SYSTEMS.md) for the full architecture map.
   in `db.portal_cookies` and reloaded on startup; auto re-login on 401.
 - **Atomic bracket entry** — entry IOC + SL trigger sent in one `bulk_orders`
   call (`grouping="normalTpsl"`); SL updates are cancel-by-cloid + replace.
+- **Auto-trailing stops** — after every partial TP, the bot moves the SL on HL
+  itself (TP1/TP2 → BE, TP3 → TP1 price, TP4 → TP2 price) instead of waiting
+  for a portal `stop_update` event that may never come.
+- **Unified-account margin** — `get_available_margin` queries `spot_user_state`
+  (USDC total − hold), not `user_state`, since unified accounts report zero
+  balance on per-perp-dex user states.
 - **Fixed-size scaling** — portal signals carry a $100 tracking size; bot uses
   `HL_MARGIN_USD × HL_LEVERAGE` for real notional.
 - **STALE guard** — events older than bot startup (minus 5 min slack) appear
@@ -46,6 +52,7 @@ See [docs/SYSTEMS.md](docs/SYSTEMS.md) for the full architecture map.
 
 ## Active Work
 - [ ] Continue documenting newer scripts (`diagnostics_check.py`, `cleanup_stale_trades.py`, dedup checks) under docs/
+- [ ] Persist TP1/TP2 prices on `hl_opened_trades` (or read from `hl_tp_updates`) — TP3/TP4 auto-trail currently no-ops because `opened.get("tp1"/"tp2")` is always None
 - [ ] Decide on Phase-3 enhancements (TP-trigger pre-placement on HL vs portal-driven partial closes)
 
 > Earlier "build webhook listener / map portal fields → HL params /

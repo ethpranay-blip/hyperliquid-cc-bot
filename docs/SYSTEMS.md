@@ -31,6 +31,9 @@ app/main.py  (NiceGUI app + supervisor)
   • Stale-trade guard (portal ts < startup cutoff → entry blocked)
   • Auto-mode + manual Enter button → enter_trade
   • Pre-flight margin check; insufficient margin → DROP signal (no backfill)
+  • Auto-trailing stop: after every partial TP, _auto_trail_stop_after_tp
+    moves the SL on HL per Corgi rules (TP1/TP2 → BE, TP3 → TP1, TP4 → TP2)
+    without waiting for a portal stop_update event
   • Periodic reconcile (60s) + HL userEvents-driven reconcile (~2s debounced)
   • heartbeat_loop → notifier (every HEARTBEAT_INTERVAL_SECONDS, default 600s)
         │
@@ -46,7 +49,8 @@ app/hyperliquid_client.py  (HyperliquidClient)
   • update_stop — cancel old SL by cloid + place fresh trigger
   • Fill reconciliation via user_fills_by_time → real fee/pnl/avg_fill
   • Deterministic Cloids per trade_id (entry + disjoint SL cloid)
-  • get_available_margin (withdrawable), open_positions (None on failure)
+  • get_available_margin via spot_user_state (unified-account aware:
+    USDC total − hold from spot clearinghouse), open_positions (None on failure)
         │
         ▼
 Hyperliquid (mainnet or testnet)
@@ -65,7 +69,7 @@ app/notifier.py  (fire-and-forget Discord/Telegram webhook)
 
 | File | Responsibility | Key Interfaces |
 |------|---------------|----------------|
-| `app/main.py` | NiceGUI dashboard (port 8080), startup/shutdown, event router, supervised portal poll, periodic + WS-driven reconcilers, heartbeat, manual button actions | `on_startup`, `route_event`, `enter_trade`, `cancel_trade`, `EVENT_HANDLERS` |
+| `app/main.py` | NiceGUI dashboard (port 8080), startup/shutdown, event router, supervised portal poll, periodic + WS-driven reconcilers, heartbeat, manual button actions, auto-trailing stops on TP hits | `on_startup`, `route_event`, `enter_trade`, `cancel_trade`, `_auto_trail_stop_after_tp`, `EVENT_HANDLERS` |
 | `app/portal.py` | Async portal client, session-cookie auth, activity-feed polling, event parsing + dedup, follow-and-fetch trade enrichment | `PortalClient.start/login/poll/get_activity_feed/get_trade_detail`, `PortalAuthError` |
 | `app/hyperliquid_client.py` | HL SDK wrapper, WS price + userEvents feed, HIP-3 + k-coin resolution, atomic bracket open, close / partial TP / SL update, fill reconciliation | `HyperliquidClient.open_trade/close_trade/partial_tp/update_stop/start_price_feed/open_positions/get_available_margin`, `hl_symbol_for`, `round_px`, `cloid_for`, `HyperliquidValidationError` |
 | `app/db.py` | SQLite WAL, schema + lightweight migrations, all persistence | `init_db`, `add_live_trade`, `is_coin_live`, `insert_opened_trade`, `insert_closed_trade`, `insert_sl_update`, `insert_tp_update`, `insert_portal_event`, `get_stats`, `get_historic_trades`, `list_pending_trades`, `get/set/clear_portal_cookies` |
@@ -188,7 +192,13 @@ A lightweight migration in `_apply_migrations` adds `my_fill_price` to old DBs.
 
 - **STALE guard**: every event with portal timestamp < `startup_time_ms − STALE_SLACK_MS` (5 min) is dashboard-only — neither auto-mode nor manual Enter can take it. Override with `FORCE_ENTER_TIDS`.
 - **Backlog dedup**: `seed_closed_from_backlog()` pre-seeds every `trade_closed_*` event id from the current activity feed into `hl_closed_trades` with `close_type='pre-seeded'`, so a fresh DB never replays historical opens as live trades.
-- **Pre-flight margin**: `enter_trade` checks `withdrawable` before submitting. Insufficient margin → DROP (no backfill, by design — May 1 decision).
+- **Pre-flight margin**: `enter_trade` calls `get_available_margin()` before submitting. As of May 11, that helper queries `spot_user_state()` (not `user_state`) and returns `USDC total − hold` — required for unified accounts where per-perp-dex user states report zero balance. Insufficient margin → DROP (no backfill, by design — May 1 decision). When the spot query returns all zeros (transient API failure heuristic), the margin check is skipped rather than silently dropping legitimate trades.
+- **Auto-trailing stops**: `_auto_trail_stop_after_tp` fires inside `handle_tp_hit` after every partial TP and pushes a fresh SL trigger to HL via `update_stop` — independent of any portal `stop_update` event. Rule table (Corgi Calls):
+  - TP1 hit → SL to entry (breakeven)
+  - TP2 hit → SL stays at entry (BE)
+  - TP3 hit → SL to TP1 price
+  - TP4 hit → SL to TP2 price
+  Each move is recorded in `hl_sl_updates` and surfaced on the activity feed as `🔒 AUTO SL→<price> <coin> #<id> (<reason>)`. **Known limitation**: TP3/TP4 trails read `opened.get("tp1")` / `opened.get("tp2")` from the live trade row, but `hl_opened_trades` does not currently persist TP levels — so TP3/TP4 trails silently no-op until the schema is extended (or the levels are pulled from the most recent `hl_tp_updates` row). TP1/TP2 → BE work today.
 - **`open_positions()` returns `None` on failure** (vs `[]` for "really empty"). Reconcile callers MUST distinguish, otherwise a transient HL API blip wipes live positions from DB (May 1 incident).
 - **`round_px`** is mandatory on every price sent to HL — wrong precision is silently rejected.
 - **Atomic bracket**: `open_trade` sends entry IOC + SL trigger in one `bulk_orders` call with `grouping="normalTpsl"` (or `"na"` if no SL). SL update is cancel-by-cloid + place-fresh, because HL `modify_order` doesn't work on resting triggers.

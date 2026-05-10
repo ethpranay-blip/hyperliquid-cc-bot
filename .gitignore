@@ -28,3 +28,12 @@ venv/
 .DS_Store
 Thumbs.db
 .bot.pid
+
+# Local backups (full snapshots — large, redundant with origin)
+backups/
+
+# One-off local debug / sync / test scripts
+# (debug_events.py is the long-lived tracked one; new throwaways stay local)
+debug_margin_api.py
+sync_hl_positions.py
+test_*.py
