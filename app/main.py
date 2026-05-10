@@ -372,18 +372,31 @@ async def _auto_trail_stop_after_tp(
         reason = f"TP{tp_num} hit → BE"
 
     elif tp_num == 3:
-        # TP3 hit → move to TP1 price
-        tp1_price = opened.get("tp1")
+        # TP3 hit → move to TP1 price (looked up from hl_tp_updates,
+        # since hl_opened_trades does not persist TP levels).
+        tp1_price = db.get_tp_price_from_history(trade_id, tp_num=1)
         if tp1_price is not None:
             new_stop = float(tp1_price)
             reason = "TP3 hit → TP1"
+        else:
+            log.warning(
+                "AUTO TRAILING: TP3 hit on #%s but no TP1 row in hl_tp_updates "
+                "— SL not moved (was the bot offline when TP1 hit?)",
+                trade_id,
+            )
 
     elif tp_num == 4:
-        # TP4 hit → move to TP2 price
-        tp2_price = opened.get("tp2")
+        # TP4 hit → move to TP2 price (same lookup path as TP3 → TP1).
+        tp2_price = db.get_tp_price_from_history(trade_id, tp_num=2)
         if tp2_price is not None:
             new_stop = float(tp2_price)
             reason = "TP4 hit → TP2"
+        else:
+            log.warning(
+                "AUTO TRAILING: TP4 hit on #%s but no TP2 row in hl_tp_updates "
+                "— SL not moved (was the bot offline when TP2 hit?)",
+                trade_id,
+            )
 
     if new_stop is None:
         return
