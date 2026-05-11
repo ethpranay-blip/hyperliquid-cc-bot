@@ -334,6 +334,11 @@ async def handle_new_trade(event: dict) -> None:
         _push_activity(
             "stale", f"STALE {coin} {side.upper()} #{trade_id}", trade_id,
         )
+        notifier.notify_skipped(
+            coin=coin, side=side, reason="stale", caller=caller,
+            trade_id=int(trade_id),
+            detail="posted before bot start",
+        )
         return
 
     # Auto-mode: open immediately if coin not already live
@@ -341,6 +346,11 @@ async def handle_new_trade(event: dict) -> None:
         if db.is_coin_live(coin):
             log.info("auto-mode: %s already live → BLOCKED for #%s", coin, trade_id)
             _push_activity("blocked", f"BLOCKED {coin} (already live) #{trade_id}", trade_id)
+            notifier.notify_skipped(
+                coin=coin, side=side, reason="blocked_coin_live",
+                caller=caller, trade_id=int(trade_id),
+                detail=f"{coin} already has an open position",
+            )
             return
         log.info("auto-mode: entering #%s", trade_id)
         await enter_trade(trade_id)
@@ -427,6 +437,12 @@ async def _auto_trail_stop_after_tp(
 
         log.info("AUTO TRAILING: SL updated #%s → %.4f (%s)", trade_id, new_stop, reason)
 
+        notifier.notify_sl_moved(
+            coin=coin, side=side, old_stop=opened.get("entry_sl"),
+            new_stop=float(new_stop), reason=reason,
+            trade_id=int(trade_id), dry_run=state.dry_run,
+        )
+
     except Exception:
         log.exception("AUTO TRAILING: update_stop failed #%s", trade_id)
 
@@ -462,6 +478,11 @@ async def handle_stop_update(event: dict) -> None:
             new_stop=float(new_stop),
         )
         log.info("SL updated #%s → %s", trade_id, new_stop)
+        notifier.notify_sl_moved(
+            coin=coin, side=side, old_stop=opened.get("entry_sl"),
+            new_stop=float(new_stop), reason="portal update",
+            trade_id=int(trade_id), dry_run=state.dry_run,
+        )
     except Exception:
         log.exception("update_stop failed #%s", trade_id)
 
@@ -657,6 +678,11 @@ async def enter_trade(trade_id: int) -> None:
 
     if db.is_coin_live(coin):
         _safe_notify(f"BLOCKED: {coin} already live", "warning")
+        notifier.notify_skipped(
+            coin=coin, side=side, reason="blocked_coin_live",
+            caller=caller, trade_id=int(trade_id),
+            detail=f"{coin} already has an open position",
+        )
         return
     if state.hl is None:
         _safe_notify("HL client not ready", "negative")
@@ -684,6 +710,11 @@ async def enter_trade(trade_id: int) -> None:
             f"💸 DROPPED #{trade_id} {coin} — insufficient margin "
             f"(${available:.2f} avail, ${required:.2f} needed)",
             "warning",
+        )
+        notifier.notify_skipped(
+            coin=coin, side=side, reason="insufficient_margin",
+            caller=caller, trade_id=int(trade_id),
+            detail=f"${available:.2f} avail < ${required:.2f} needed",
         )
         state.pending_trades.pop(int(trade_id), None)
         state.fire_refresh()

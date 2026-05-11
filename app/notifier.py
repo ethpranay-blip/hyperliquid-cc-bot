@@ -273,6 +273,81 @@ class Notifier:
         lines.append(f"• {_utcnow()}")
         self._dispatch("\n".join(lines))
 
+    def notify_sl_moved(
+        self,
+        *,
+        coin: str,
+        side: str,
+        old_stop: Optional[float],
+        new_stop: float,
+        reason: Optional[str] = None,
+        trade_id: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> None:
+        """Stop-loss PRICE was changed on HL (not triggered).
+
+        Fires for both portal-driven `stop_update` events and the automatic
+        post-TP trailing logic. `reason` distinguishes them in the message
+        (e.g. "TP2 hit → BE", "portal update").
+        """
+        if not self.enabled:
+            return
+        header = "🔒 STOP LOSS MOVED" + ("  [DRY RUN]" if dry_run else "")
+        lines = [
+            header,
+            f"• {coin}  {_side_arrow(side)}",
+        ]
+        if old_stop is not None:
+            lines.append(f"• From: {_fmt_price(old_stop)}")
+        lines.append(f"• To:   {_fmt_price(new_stop)}")
+        if reason:
+            lines.append(f"• Why:  {reason}")
+        if trade_id is not None:
+            lines.append(f"• Trade: #{trade_id}")
+        lines.append(f"• {_utcnow()}")
+        self._dispatch("\n".join(lines))
+
+    def notify_skipped(
+        self,
+        *,
+        coin: str,
+        reason: str,
+        side: Optional[str] = None,
+        detail: Optional[str] = None,
+        trade_id: Optional[int] = None,
+        caller: Optional[str] = None,
+    ) -> None:
+        """A new-trade signal was NOT entered.
+
+        `reason` is one of:
+          - "stale"               — posted before bot startup cutoff
+          - "blocked_coin_live"   — same coin already has an open position
+          - "insufficient_margin" — pre-flight withdrawable < required
+        Other strings are accepted as-is for future cases.
+        """
+        if not self.enabled:
+            return
+        icon = {
+            "stale": "🕰️",
+            "blocked_coin_live": "🚫",
+            "insufficient_margin": "💸",
+        }.get(reason, "⚠️")
+        header = f"{icon} TRADE SKIPPED"
+        lines = [header]
+        if side:
+            lines.append(f"• {coin}  {_side_arrow(side)}")
+        else:
+            lines.append(f"• {coin}")
+        lines.append(f"• Reason: {reason.replace('_', ' ')}")
+        if detail:
+            lines.append(f"• Detail: {detail}")
+        if caller:
+            lines.append(f"• Caller: {caller}")
+        if trade_id is not None:
+            lines.append(f"• Trade: #{trade_id}")
+        lines.append(f"• {_utcnow()}")
+        self._dispatch("\n".join(lines))
+
     def notify_heartbeat(
         self,
         *,
@@ -351,6 +426,14 @@ def notify_tp_hit(**kwargs) -> None:
 
 def notify_heartbeat(**kwargs) -> None:
     _default.notify_heartbeat(**kwargs)
+
+
+def notify_sl_moved(**kwargs) -> None:
+    _default.notify_sl_moved(**kwargs)
+
+
+def notify_skipped(**kwargs) -> None:
+    _default.notify_skipped(**kwargs)
 
 
 def reload_from_env() -> None:
