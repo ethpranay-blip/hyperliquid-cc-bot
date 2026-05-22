@@ -521,17 +521,44 @@ def insert_tp_update(
     return int(cur.lastrowid)
 
 
-def get_tp_price_from_history(trade_id: int, tp_num: int) -> Optional[float]:
-    """Return the most recent recorded tp_price for (trade_id, tp_num).
+def get_tp_update_count(trade_id: int) -> int:
+    """Return how many TP-hit rows we've recorded for this trade.
 
-    Used by main._auto_trail_stop_after_tp to look up TP1/TP2 prices when a
-    later TP hits, because hl_opened_trades does not persist TP levels.
+    Used to infer `tp_num` when the portal's tp_hit event doesn't carry one
+    (common case — see May 18-19 NEAR #828 logs: TPs hit and partial closes
+    booked, but `tp_num` was None on every event, silently disabling the
+    auto-trailing-stop logic for that trade).
+
+    Because `db.insert_tp_update` runs inside `handle_tp_hit` *before*
+    `_auto_trail_stop_after_tp` is called, the just-booked TP is already
+    in the count — so the return value IS the inferred tp_num for the
+    in-flight TP (1st row → TP1, 2nd → TP2, …).
+    """
+    row = _execute(
+        "SELECT COUNT(*) AS n FROM hl_tp_updates WHERE trade_id = ?;",
+        (int(trade_id),),
+    ).fetchone()
+    return int(row["n"] or 0) if row is not None else 0
+
+
+def get_tp_price_from_history(trade_id: int, tp_num: int) -> Optional[float]:
+    """Return the tp_price of the Nth TP recorded for this trade (1-indexed).
+
+    Two-stage lookup so it works whether or not the portal supplied tp_num:
+
+      1. If any rows have a matching `tp_num` column set, return the most
+         recent one's tp_price (preserves the original semantics from when
+         the portal DID send tp_num).
+      2. Otherwise fall back to ordinal position: TPs ordered oldest-first
+         by id, return the (tp_num)-th row's tp_price.
+
     Rows with tp_price <= 0 are filtered out — `insert_tp_update` falls back
     to 0.0 when both the portal `tp_price` and HL `avg_exit_price` are null,
     and trailing the SL to 0 would be catastrophic for a long position.
 
     Returns None if no qualifying row exists.
     """
+    # Stage 1 — exact tp_num match (legacy / when portal sends tp_num)
     row = _execute(
         """
         SELECT tp_price FROM hl_tp_updates
@@ -540,6 +567,22 @@ def get_tp_price_from_history(trade_id: int, tp_num: int) -> Optional[float]:
         LIMIT 1;
         """,
         (int(trade_id), int(tp_num)),
+    ).fetchone()
+    if row is not None:
+        return float(row["tp_price"])
+
+    # Stage 2 — ordinal fallback (current case: portal omits tp_num).
+    # OFFSET is 0-based, so the Nth row needs OFFSET (tp_num - 1).
+    if tp_num < 1:
+        return None
+    row = _execute(
+        """
+        SELECT tp_price FROM hl_tp_updates
+        WHERE trade_id = ? AND tp_price > 0
+        ORDER BY id ASC
+        LIMIT 1 OFFSET ?;
+        """,
+        (int(trade_id), int(tp_num) - 1),
     ).fetchone()
     return float(row["tp_price"]) if row is not None else None
 
