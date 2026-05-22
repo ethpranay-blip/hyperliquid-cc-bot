@@ -355,12 +355,35 @@ async def _auto_trail_stop_after_tp(
     - TP2 hit → Keep stop at entry (BE)
     - TP3 hit → Move stop to TP1 price
     - TP4 hit → Move stop to TP2 price
+
+    The portal often omits `tp_num` in the tp_hit event (NEAR #828 on May
+    18-19 is the canonical case: 3 TPs booked, every one with tp_num=None,
+    auto-trail silently skipped on all three). When that happens we infer
+    tp_num by counting how many TP rows already exist for this trade — and
+    since db.insert_tp_update runs before this function in handle_tp_hit,
+    the just-booked TP is included, so the count IS the inferred tp_num.
     """
-    if tp_num is None or state.hl is None:
+    if state.hl is None:
+        log.warning("AUTO TRAILING: skip #%s — HL client not ready", trade_id)
         return
+
+    if tp_num is None:
+        inferred = db.get_tp_update_count(int(trade_id))
+        if inferred < 1:
+            log.warning(
+                "AUTO TRAILING: skip #%s — tp_num None and no TP rows yet "
+                "(insert_tp_update may not have run)", trade_id,
+            )
+            return
+        log.info(
+            "AUTO TRAILING: portal omitted tp_num for #%s — inferred=%d "
+            "(from hl_tp_updates row count)", trade_id, inferred,
+        )
+        tp_num = inferred
 
     entry = opened.get("entry_price")
     if entry is None:
+        log.warning("AUTO TRAILING: skip #%s — entry_price missing in DB", trade_id)
         return
 
     # Determine new stop based on TP number
@@ -399,6 +422,10 @@ async def _auto_trail_stop_after_tp(
             )
 
     if new_stop is None:
+        log.warning(
+            "AUTO TRAILING: skip #%s — new_stop unresolved (tp_num=%s)",
+            trade_id, tp_num,
+        )
         return
 
     # Update stop on Hyperliquid
@@ -471,6 +498,10 @@ async def handle_tp_hit(event: dict) -> None:
     size_pct = event.get("size_pct")
     tp_price = event.get("tp_price")
     tp_num = event.get("tp_num")
+    log.info(
+        "tp_hit fields: trade_id=%s tp_num=%r size_pct=%r tp_price=%r",
+        trade_id, tp_num, size_pct, tp_price,
+    )
     if trade_id is None or size_pct is None:
         return
     if not db.get_live_trade(int(trade_id)):
