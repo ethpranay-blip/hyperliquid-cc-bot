@@ -140,6 +140,13 @@ state = AppState()
 # clock skew between the portal and this host.
 STALE_SLACK_MS = 5 * 60 * 1000
 
+# HOTFIX (May 22): kill-switch for the auto-trail-after-TP logic. Set False
+# while the fill-price + ratchet fix is built/tested, because the current
+# trail computes BE from the LIMIT price (entry_price) instead of the actual
+# fill (my_fill_price), which instantly stop-outs shorts (and longs) the
+# moment a TP books. Flip to True (or gate on env) only once that fix lands.
+_AUTO_TRAIL_ENABLED = os.environ.get("AUTO_TRAIL_ENABLED", "false").lower() in ("1", "true", "yes")
+
 
 # ============================================================
 # SECTION: Activity feed helpers
@@ -363,6 +370,23 @@ async def _auto_trail_stop_after_tp(
     since db.insert_tp_update runs before this function in handle_tp_hit,
     the just-booked TP is included, so the count IS the inferred tp_num.
     """
+    # ── HOTFIX (May 22): auto-trail TEMPORARILY DISABLED ──
+    # BE was computed from opened["entry_price"], which stores the
+    # slippage-padded LIMIT price (mid×1.05 long / mid×0.95 short), NOT the
+    # actual fill (my_fill_price). For a short the limit sits BELOW the fill,
+    # so the trailed SL landed below current price and HL triggered it
+    # instantly — full-closing the remaining 75% the moment TP1 booked
+    # (confirmed live on VVV short and BTC short, May 22). Partial closes and
+    # portal-driven stop_update moves are NOT affected by this gate.
+    # Re-enabled by the fill-price + ratchet fix (flip _AUTO_TRAIL_ENABLED).
+    if not _AUTO_TRAIL_ENABLED:
+        log.warning(
+            "AUTO TRAILING: DISABLED (hotfix) — not moving SL for #%s tp_num=%s. "
+            "Partial close already booked; portal-driven stops remain active.",
+            trade_id, tp_num,
+        )
+        return
+
     if state.hl is None:
         log.warning("AUTO TRAILING: skip #%s — HL client not ready", trade_id)
         return
