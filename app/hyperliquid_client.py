@@ -56,6 +56,7 @@ except ImportError:  # pragma: no cover
     from hyperliquid.utils.types import Cloid  # type: ignore  # older SDKs
 
 from app import db
+from app.sizing import compute_position_size
 
 log = logging.getLogger(__name__)
 
@@ -768,6 +769,10 @@ class HyperliquidClient:
         portal_stop: Optional[float] = None,
         leverage: Optional[float] = None,
         slippage: float = DEFAULT_SLIPPAGE,
+        sizing_mode: str = "fixed_margin",
+        margin_usd: Optional[float] = None,
+        risk_usd: Optional[float] = None,
+        available_margin: Optional[float] = None,
     ) -> OpenResult:
         side_l = side.lower()
         if side_l not in ("long", "short", "buy", "sell"):
@@ -792,24 +797,37 @@ class HyperliquidClient:
                 f"no live mid price for {order_name}; cannot size order"
             )
 
-        size = self._compute_size(mid, lev, sz_dec)
-
-        # Scale stop for k-coins, then ALWAYS round_px every price
+        # Scale stop for k-coins, then round. Compute the SL price BEFORE size
+        # so fixed-risk sizing can use the entry-to-SL distance.
         hl_stop = scale_stop_for_k(portal_coin, portal_stop, portal_entry, mid)
+        sl_px = round_px(hl_stop, sz_dec) if hl_stop is not None else None
+
+        # Size per the active mode (fixed margin vs fixed risk). Pure function
+        # in app/sizing; raises ValueError below min-notional → map to a
+        # validation error so enter_trade handles it like any rejection.
+        try:
+            size, size_basis = compute_position_size(
+                mode=sizing_mode,
+                mid=mid, leverage=lev, sz_decimals=sz_dec, sl_px=sl_px,
+                margin_usd=(margin_usd if margin_usd is not None else self.margin_usd),
+                risk_usd=(risk_usd if risk_usd is not None else self.margin_usd),
+                available_margin=available_margin,
+                min_notional=MIN_NOTIONAL_USD,
+            )
+        except ValueError as exc:
+            raise HyperliquidValidationError(str(exc))
 
         # Entry limit with ±slippage, IOC
         slip_mul = (1 + slippage) if is_buy else (1 - slippage)
         entry_px = round_px(mid * slip_mul, sz_dec)
 
-        sl_px = round_px(hl_stop, sz_dec) if hl_stop is not None else None
-
         entry_cloid = cloid_for(trade_id)
         sl_cloid = sl_cloid_for(trade_id) if sl_px is not None else None
 
         log.info(
-            "OPEN %s #%s %s %s sz=%s entry=%s sl=%s lev=%sx dex=%r dry_run=%s",
+            "OPEN %s #%s %s %s sz=%s entry=%s sl=%s lev=%sx dex=%r [%s] dry_run=%s",
             order_name, trade_id, side_l, "BUY" if is_buy else "SELL",
-            size, entry_px, sl_px, lev, dex, self.dry_run,
+            size, entry_px, sl_px, lev, dex, size_basis, self.dry_run,
         )
 
         if self.dry_run:
