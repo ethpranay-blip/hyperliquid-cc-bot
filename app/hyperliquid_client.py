@@ -1267,6 +1267,48 @@ class HyperliquidClient:
                     return None
         return None
 
+    async def get_resting_stop_price(self, order_name: str) -> Optional[float]:
+        """Best-effort: triggerPx of a resting reduce-only stop for `order_name`.
+
+        Used by startup adoption to recover the current SL of a position the
+        DB lost track of, so the ratchet has a baseline. Returns None if no
+        such order is found or the query fails — adoption proceeds either way.
+        `order_name` must be the HL-side coin string (dex-prefixed for HIP-3).
+        """
+        if self._info is None or not self.main_address:
+            return None
+
+        def _call():
+            try:
+                return self._info.frontend_open_orders(self.main_address)
+            except Exception:
+                return None
+
+        try:
+            orders = await asyncio.to_thread(_call)
+        except Exception:
+            return None
+        if not isinstance(orders, list):
+            return None
+
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            if o.get("coin") != order_name:
+                continue
+            if not o.get("reduceOnly"):
+                continue
+            otype = str(o.get("orderType") or "").lower()
+            is_trigger = o.get("isTrigger") or "stop" in otype or "trigger" in otype
+            if not is_trigger:
+                continue
+            tp = o.get("triggerPx")
+            try:
+                return float(tp) if tp is not None else None
+            except (ValueError, TypeError):
+                return None
+        return None
+
     async def get_available_margin(self) -> Optional[float]:
         """Return USDC available as initial margin for new perp positions.
 

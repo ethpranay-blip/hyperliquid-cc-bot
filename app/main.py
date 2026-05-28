@@ -46,6 +46,7 @@ from app.hyperliquid_client import (
 )
 from app.portal import PortalClient, PortalAuthError
 from app.trailing import compute_trailed_stop
+from app.adoption import build_open_trade_index
 
 
 # ============================================================
@@ -141,12 +142,6 @@ state = AppState()
 # clock skew between the portal and this host.
 STALE_SLACK_MS = 5 * 60 * 1000
 
-# HOTFIX (May 22): kill-switch for the auto-trail-after-TP logic. Set False
-# while the fill-price + ratchet fix is built/tested, because the current
-# trail computes BE from the LIMIT price (entry_price) instead of the actual
-# fill (my_fill_price), which instantly stop-outs shorts (and longs) the
-# moment a TP books. Flip to True (or gate on env) only once that fix lands.
-_AUTO_TRAIL_ENABLED = os.environ.get("AUTO_TRAIL_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
 # ============================================================
@@ -377,19 +372,10 @@ async def _auto_trail_stop_after_tp(
     3. VALIDITY GUARD: refuse to place an SL on the wrong side of the live mid
        (it would trigger instantly). Belt-and-suspenders on top of (1).
 
-    Gated by AUTO_TRAIL_ENABLED (default False) until verified in production.
     The portal usually omits tp_num; we infer it from the recorded TP count
     (db.insert_tp_update runs before this in handle_tp_hit, so the count IS
     this TP's ordinal).
     """
-    if not _AUTO_TRAIL_ENABLED:
-        log.info(
-            "AUTO TRAILING: disabled (AUTO_TRAIL_ENABLED unset) — skip #%s "
-            "tp_num=%s. Partial close booked; portal stops remain active.",
-            trade_id, tp_num,
-        )
-        return
-
     if state.hl is None:
         log.warning("AUTO TRAILING: skip #%s — HL client not ready", trade_id)
         return
@@ -1084,6 +1070,90 @@ async def seed_closed_from_backlog() -> None:
     )
 
 
+def _bare(name):
+    """Strip a HIP-3 dex prefix ("xyz:SILVER" → "SILVER"). HL reports
+    positions/orders using the dex-prefixed order_name; the DB and portal
+    use the bare coin. Normalize to bare for matching."""
+    if not isinstance(name, str):
+        return name
+    return name.split(":", 1)[1] if ":" in name else name
+
+
+async def _adopt_untracked_positions(hl_positions: list[dict], only_hl: set) -> None:
+    """Re-link live HL positions the DB lost track of back to their portal
+    trades, so the bot resumes managing their TPs/stops automatically.
+
+    For each HL position whose coin isn't in the DB, recover the portal
+    trade_id from the activity feed (most recent still-open trade for that
+    coin), then insert hl_opened_trades + hl_live_trades rows using HL's real
+    entry price (= breakeven) and current resting stop. Best-effort: any
+    position we can't match to a portal trade is left untouched and logged.
+    """
+    if state.portal is None or state.hl is None:
+        return
+    try:
+        raw_events = await state.portal.get_activity_feed()
+    except Exception:
+        log.exception("adopt: could not fetch activity feed — skipping adoption")
+        return
+
+    index = build_open_trade_index(raw_events, lambda c: _bare(hl_symbol_for(c)))
+    adopted = 0
+    for p in hl_positions:
+        coin_key = _bare(p.get("coin") or "")
+        if coin_key not in only_hl:
+            continue
+        match = index.get(coin_key)
+        if match is None:
+            log.warning(
+                "adopt: %s open on HL but no matching open portal trade in feed "
+                "— cannot recover trade_id, left untouched (manual position?)",
+                coin_key,
+            )
+            continue
+        tid = int(match["trade_id"])
+        if db.get_live_trade(tid) is not None or db.get_closed_trade(tid) is not None:
+            continue  # already known
+
+        try:
+            resting_stop = await state.hl.get_resting_stop_price(p.get("coin"))
+        except Exception:
+            resting_stop = None
+
+        entry = float(p.get("entry_price") or 0.0)
+        side = (p.get("side") or match.get("side") or "long")
+        try:
+            db.insert_opened_trade(
+                trade_id=tid, coin=coin_key, side=side,
+                entry_price=entry, entry_sl=resting_stop,
+                size=float(p.get("size") or 0.0),
+                margin=state.hl.margin_usd,
+                leverage=p.get("leverage") or state.hl.default_leverage,
+                caller=match.get("caller") or "adopted",
+                my_fill_price=entry,   # HL's entryPx IS the real avg fill / BE
+            )
+            db.add_live_trade(tid)
+            adopted += 1
+            log.warning(
+                "adopt: now tracking %s as portal #%s "
+                "(entry=%s sl=%s size=%s caller=%s) — bot will manage its TPs/stops",
+                coin_key, tid, entry, resting_stop, p.get("size"), match.get("caller"),
+            )
+            _push_activity(
+                "opened",
+                f"ADOPTED {coin_key} {side.upper()} #{tid} (entry {_fmt_price(entry)})",
+                tid,
+            )
+        except Exception:
+            log.exception("adopt: failed to insert tracking for %s #%s", coin_key, tid)
+
+    if adopted:
+        log.warning(
+            "adopt: recovered %d untracked position(s) — auto-trail + TP "
+            "mirroring now active for them", adopted,
+        )
+
+
 async def reconcile_on_startup() -> None:
     """Compare HL open positions to DB live trades; log mismatches.
 
@@ -1107,14 +1177,6 @@ async def reconcile_on_startup() -> None:
             "a transient API blip"
         )
         return
-
-    # HL reports positions using order_name (prefixed for HIP-3, e.g. "xyz:SILVER").
-    # DB stores the portal coin (bare, e.g. "SILVER"). Normalize both to the
-    # bare symbol by stripping any leading "dex:" prefix so the set-diff works.
-    def _bare(name):
-        if not isinstance(name, str):
-            return name
-        return name.split(":", 1)[1] if ":" in name else name
 
     hl_coins = {_bare(p["coin"]) for p in hl_positions if p.get("coin")}
     db_live = db.list_live_trades()
@@ -1155,10 +1217,11 @@ async def reconcile_on_startup() -> None:
 
     if only_hl:
         log.warning(
-            "startup sync: HL has positions not tracked in DB: %s "
-            "(opened manually? — left untouched)",
+            "startup sync: HL has positions not tracked in DB: %s — "
+            "attempting adoption so the bot manages them",
             sorted(only_hl),
         )
+        await _adopt_untracked_positions(hl_positions, only_hl)
     if only_db:
         log.warning(
             "startup sync: DB marks live but HL has no position: %s "
