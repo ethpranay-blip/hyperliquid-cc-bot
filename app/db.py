@@ -135,6 +135,15 @@ CREATE TABLE IF NOT EXISTS hl_pending_trades (
     retry_count   INTEGER NOT NULL DEFAULT 0
 );
 
+-- Live, dashboard-editable settings (key/value). Currently holds the
+-- position-sizing mode + amounts so the user can switch between fixed-margin
+-- and fixed-risk sizing from the dashboard without a redeploy.
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    at    TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_opened_trade_id ON hl_opened_trades(trade_id);
 CREATE INDEX IF NOT EXISTS idx_closed_trade_id ON hl_closed_trades(trade_id);
 CREATE INDEX IF NOT EXISTS idx_closed_at       ON hl_closed_trades(at);
@@ -891,6 +900,61 @@ def bump_pending_retry(trade_id: int) -> None:
         """,
         (_utcnow_iso(), int(trade_id)),
     )
+
+
+# ============================================================
+# SECTION: bot_settings — live dashboard-editable key/value config
+# ============================================================
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    row = _execute(
+        "SELECT value FROM bot_settings WHERE key = ?;", (key,),
+    ).fetchone()
+    return row["value"] if row is not None else default
+
+
+def set_setting(key: str, value: str) -> None:
+    _execute(
+        """
+        INSERT INTO bot_settings (key, value, at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = excluded.at;
+        """,
+        (key, str(value), _utcnow_iso()),
+    )
+
+
+def get_sizing_settings(
+    *, default_margin_usd: float, default_risk_usd: Optional[float] = None,
+) -> dict:
+    """Return the current sizing config, falling back to env-derived defaults.
+
+    Keys:
+      sizing_mode : "fixed_margin" | "fixed_risk"  (default "fixed_margin")
+      margin_usd  : float — $ margin per trade in fixed_margin mode
+      risk_usd    : float — $ risk per trade in fixed_risk mode
+    """
+    mode = get_setting("sizing_mode", "fixed_margin") or "fixed_margin"
+    if mode not in ("fixed_margin", "fixed_risk"):
+        mode = "fixed_margin"
+
+    def _f(key: str, fallback: float) -> float:
+        raw = get_setting(key)
+        if raw is None:
+            return float(fallback)
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return float(fallback)
+
+    return {
+        "sizing_mode": mode,
+        "margin_usd": _f("margin_usd", default_margin_usd),
+        "risk_usd": _f(
+            "risk_usd",
+            default_risk_usd if default_risk_usd is not None else default_margin_usd,
+        ),
+    }
 
 
 # ============================================================

@@ -42,7 +42,7 @@ from app import db
 from app import notifier
 from app.hyperliquid_client import (
     HyperliquidClient, HyperliquidError, HyperliquidValidationError,
-    hl_symbol_for,
+    hl_symbol_for, MIN_NOTIONAL_USD,
 )
 from app.portal import PortalClient, PortalAuthError
 from app.trailing import compute_trailed_stop
@@ -704,18 +704,29 @@ async def enter_trade(trade_id: int) -> None:
         _safe_notify("HL client not ready", "negative")
         return
 
+    # ── SIZING MODE (live, dashboard-editable) ──
+    sizing = db.get_sizing_settings(default_margin_usd=state.hl.margin_usd)
+    mode = sizing["sizing_mode"]
+    margin_usd = sizing["margin_usd"]
+    risk_usd = sizing["risk_usd"]
+
     # ── PRE-FLIGHT MARGIN CHECK ──
-    # Check withdrawable BEFORE submitting. If insufficient, DROP the signal
-    # cleanly (don't queue, don't backfill later). When margin frees up,
-    # only NEW signals from that point onward will be taken.
-    # User decision May 1 — see CHANGELOG/HANDOFF.
-    required = state.hl.margin_usd
+    # Check withdrawable BEFORE submitting. In fixed_margin mode we need at
+    # least `margin_usd`. In fixed_risk mode the size is CAPPED to available
+    # margin inside open_trade, so we only need *some* usable margin (enough
+    # to clear HL's min notional); otherwise the open would size to ~0.
+    # Insufficient → DROP cleanly (no backfill — May 1 decision).
     available = await state.hl.get_available_margin()
+    if mode == "fixed_risk":
+        # Smallest margin that can still place a min-notional order at this lev.
+        required = MIN_NOTIONAL_USD / max(float(event.get("leverage") or state.hl.default_leverage), 1.0)
+    else:
+        required = margin_usd
     if available is not None and available < required:
         log.warning(
             "DROPPED #%s %s — insufficient margin: $%.2f avail, $%.2f required "
-            "(no backfill — signal lost by design)",
-            trade_id, coin, available, required,
+            "(mode=%s, no backfill — signal lost by design)",
+            trade_id, coin, available, required, mode,
         )
         _push_activity(
             "blocked",
@@ -737,6 +748,8 @@ async def enter_trade(trade_id: int) -> None:
             portal_entry=float(entry) if entry else None,
             portal_stop=float(stop) if stop else None,
             leverage=event.get("leverage"),
+            sizing_mode=mode, margin_usd=margin_usd, risk_usd=risk_usd,
+            available_margin=available,
         )
     except HyperliquidValidationError as exc:
         _safe_notify(f"Open rejected #{trade_id}: {exc}", "negative")
@@ -1463,6 +1476,53 @@ def index() -> None:
             auto_switch.on("update:model-value", _toggle_auto)
             if state.dry_run:
                 ui.label("DRY RUN").classes("dry-banner")
+
+    # ---- sizing controls (live, persisted to bot_settings; read at trade time) ----
+    with ui.expansion("⚙ Position Sizing", icon="tune").classes("w-full"):
+        _default_margin = state.hl.margin_usd if state.hl else 100.0
+        _sizing = db.get_sizing_settings(default_margin_usd=_default_margin)
+        with ui.row().classes("items-center gap-4 mt-2"):
+            mode_sel = ui.select(
+                {"fixed_margin": "Fixed Margin", "fixed_risk": "Fixed Risk (SL-based)"},
+                value=_sizing["sizing_mode"], label="Mode",
+            ).classes("w-52")
+            margin_in = ui.number(
+                label="Margin $ / trade", value=_sizing["margin_usd"],
+                min=1, step=10,
+            ).classes("w-40")
+            risk_in = ui.number(
+                label="Risk $ / trade", value=_sizing["risk_usd"],
+                min=1, step=10,
+            ).classes("w-40")
+
+            def _save_sizing() -> None:
+                m = mode_sel.value or "fixed_margin"
+                db.set_setting("sizing_mode", m)
+                try:
+                    db.set_setting("margin_usd", str(float(margin_in.value)))
+                except (ValueError, TypeError):
+                    pass
+                try:
+                    db.set_setting("risk_usd", str(float(risk_in.value)))
+                except (ValueError, TypeError):
+                    pass
+                log.info(
+                    "sizing settings saved via dashboard: mode=%s margin=$%s risk=$%s",
+                    m, margin_in.value, risk_in.value,
+                )
+                summary = (
+                    f"Fixed Risk ${risk_in.value}/trade" if m == "fixed_risk"
+                    else f"Fixed Margin ${margin_in.value}/trade"
+                )
+                ui.notify(f"Sizing saved: {summary} (applies to next trade)", type="positive")
+
+            ui.button("Save", on_click=_save_sizing, color="primary")
+        ui.label(
+            "Fixed Margin: position = margin × leverage. "
+            "Fixed Risk: size so a stop-out loses ~Risk $ (±slippage); "
+            "falls back to Fixed Margin if a call has no SL, and is capped at "
+            "available margin. Changes apply to the next trade — no redeploy."
+        ).classes("text-xs opacity-60 mt-1")
 
     with ui.row().classes("w-full no-wrap gap-4 items-start"):
         # =======================  MAIN COLUMN  ========================
