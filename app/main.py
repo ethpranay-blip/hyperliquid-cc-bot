@@ -45,6 +45,8 @@ from app.hyperliquid_client import (
     hl_symbol_for,
 )
 from app.portal import PortalClient, PortalAuthError
+from app.trailing import compute_trailed_stop
+from app.adoption import build_open_trade_index
 
 
 # ============================================================
@@ -140,12 +142,6 @@ state = AppState()
 # clock skew between the portal and this host.
 STALE_SLACK_MS = 5 * 60 * 1000
 
-# HOTFIX (May 22): kill-switch for the auto-trail-after-TP logic. Set False
-# while the fill-price + ratchet fix is built/tested, because the current
-# trail computes BE from the LIMIT price (entry_price) instead of the actual
-# fill (my_fill_price), which instantly stop-outs shorts (and longs) the
-# moment a TP books. Flip to True (or gate on env) only once that fix lands.
-_AUTO_TRAIL_ENABLED = os.environ.get("AUTO_TRAIL_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
 # ============================================================
@@ -357,40 +353,34 @@ async def _auto_trail_stop_after_tp(
     trade_id: int, coin: str, side: str, tp_num: Optional[int], opened: dict
 ) -> None:
     """
-    Automatically trail stop after TP hit per Corgi Calls rules:
-    - TP1 hit → Move stop to entry (BE)
-    - TP2 hit → Keep stop at entry (BE)
-    - TP3 hit → Move stop to TP1 price
-    - TP4 hit → Move stop to TP2 price
+    Automatically trail the stop after a TP books, per Corgi Calls rules:
+    - TP1/TP2 hit → move stop to breakeven (the ACTUAL fill price)
+    - TP3 hit     → move stop to TP1 price
+    - TP4 hit     → move stop to TP2 price
 
-    The portal often omits `tp_num` in the tp_hit event (NEAR #828 on May
-    18-19 is the canonical case: 3 TPs booked, every one with tp_num=None,
-    auto-trail silently skipped on all three). When that happens we infer
-    tp_num by counting how many TP rows already exist for this trade — and
-    since db.insert_tp_update runs before this function in handle_tp_hit,
-    the just-booked TP is included, so the count IS the inferred tp_num.
+    Three correctness guards, all added after the May 22 full-close incident:
+
+    1. BREAKEVEN = my_fill_price, NOT entry_price. entry_price stores the
+       slippage-padded LIMIT the bot sent (mid×1.05 long / mid×0.95 short).
+       Using it placed the SL on the wrong side of the fill → instant
+       stop-out the moment TP1 booked (VVV short, BTC short — May 22).
+
+    2. RATCHET (compute_trailed_stop): never loosen. Keep the tighter of
+       {tp target, current stop}. So a profit-locking stop the trader already
+       set (e.g. short @ $15.75) survives instead of being dragged back to BE.
+
+    3. VALIDITY GUARD: refuse to place an SL on the wrong side of the live mid
+       (it would trigger instantly). Belt-and-suspenders on top of (1).
+
+    The portal usually omits tp_num; we infer it from the recorded TP count
+    (db.insert_tp_update runs before this in handle_tp_hit, so the count IS
+    this TP's ordinal).
     """
-    # ── HOTFIX (May 22): auto-trail TEMPORARILY DISABLED ──
-    # BE was computed from opened["entry_price"], which stores the
-    # slippage-padded LIMIT price (mid×1.05 long / mid×0.95 short), NOT the
-    # actual fill (my_fill_price). For a short the limit sits BELOW the fill,
-    # so the trailed SL landed below current price and HL triggered it
-    # instantly — full-closing the remaining 75% the moment TP1 booked
-    # (confirmed live on VVV short and BTC short, May 22). Partial closes and
-    # portal-driven stop_update moves are NOT affected by this gate.
-    # Re-enabled by the fill-price + ratchet fix (flip _AUTO_TRAIL_ENABLED).
-    if not _AUTO_TRAIL_ENABLED:
-        log.warning(
-            "AUTO TRAILING: DISABLED (hotfix) — not moving SL for #%s tp_num=%s. "
-            "Partial close already booked; portal-driven stops remain active.",
-            trade_id, tp_num,
-        )
-        return
-
     if state.hl is None:
         log.warning("AUTO TRAILING: skip #%s — HL client not ready", trade_id)
         return
 
+    # Infer tp_num when the portal omits it.
     if tp_num is None:
         inferred = db.get_tp_update_count(int(trade_id))
         if inferred < 1:
@@ -405,79 +395,76 @@ async def _auto_trail_stop_after_tp(
         )
         tp_num = inferred
 
-    entry = opened.get("entry_price")
-    if entry is None:
-        log.warning("AUTO TRAILING: skip #%s — entry_price missing in DB", trade_id)
-        return
-
-    # Determine new stop based on TP number
-    new_stop = None
-
-    if tp_num in (1, 2):
-        # TP1 or TP2 hit → move to breakeven
-        new_stop = float(entry)
-        reason = f"TP{tp_num} hit → BE"
-
-    elif tp_num == 3:
-        # TP3 hit → move to TP1 price (looked up from hl_tp_updates,
-        # since hl_opened_trades does not persist TP levels).
-        tp1_price = db.get_tp_price_from_history(trade_id, tp_num=1)
-        if tp1_price is not None:
-            new_stop = float(tp1_price)
-            reason = "TP3 hit → TP1"
-        else:
-            log.warning(
-                "AUTO TRAILING: TP3 hit on #%s but no TP1 row in hl_tp_updates "
-                "— SL not moved (was the bot offline when TP1 hit?)",
-                trade_id,
-            )
-
-    elif tp_num == 4:
-        # TP4 hit → move to TP2 price (same lookup path as TP3 → TP1).
-        tp2_price = db.get_tp_price_from_history(trade_id, tp_num=2)
-        if tp2_price is not None:
-            new_stop = float(tp2_price)
-            reason = "TP4 hit → TP2"
-        else:
-            log.warning(
-                "AUTO TRAILING: TP4 hit on #%s but no TP2 row in hl_tp_updates "
-                "— SL not moved (was the bot offline when TP2 hit?)",
-                trade_id,
-            )
-
-    if new_stop is None:
+    # Guard 1: breakeven basis = REAL fill, not the limit price.
+    fill_price = opened.get("my_fill_price")
+    if fill_price in (None, ""):
+        fill_price = opened.get("entry_price")
         log.warning(
-            "AUTO TRAILING: skip #%s — new_stop unresolved (tp_num=%s)",
-            trade_id, tp_num,
+            "AUTO TRAILING: #%s has no my_fill_price — falling back to "
+            "entry_price (limit) for BE; trail may be slightly off", trade_id,
         )
+    if fill_price in (None, ""):
+        log.warning("AUTO TRAILING: skip #%s — no fill or entry price in DB", trade_id)
+        return
+    fill_price = float(fill_price)
+
+    is_long = side.lower() in ("long", "buy")
+    current_stop = db.get_current_stop(int(trade_id))
+    tp1_price = db.get_tp_price_from_history(int(trade_id), tp_num=1)
+    tp2_price = db.get_tp_price_from_history(int(trade_id), tp_num=2)
+
+    # Guard 2: rule target + never-loosen ratchet (pure, tested in app/trailing).
+    new_stop, reason = compute_trailed_stop(
+        is_long=is_long, tp_num=int(tp_num), fill_price=fill_price,
+        current_stop=current_stop, tp1_price=tp1_price, tp2_price=tp2_price,
+    )
+    if new_stop is None:
+        log.warning("AUTO TRAILING: skip #%s — %s", trade_id, reason)
         return
 
-    # Update stop on Hyperliquid
+    # Guard 3: never place an SL on the wrong side of the live mid (would
+    # trigger instantly). If mid is unavailable, proceed — the my_fill_price
+    # basis already prevents the original failure mode.
+    try:
+        mid = await state.hl.get_price_for_pricing(coin)
+    except Exception:
+        mid = None
+    if mid is not None and mid > 0:
+        if is_long and new_stop >= mid:
+            log.warning(
+                "AUTO TRAILING: skip #%s — long SL %.6f >= mid %.6f "
+                "(would trigger instantly); leaving existing stop in place",
+                trade_id, new_stop, mid,
+            )
+            return
+        if (not is_long) and new_stop <= mid:
+            log.warning(
+                "AUTO TRAILING: skip #%s — short SL %.6f <= mid %.6f "
+                "(would trigger instantly); leaving existing stop in place",
+                trade_id, new_stop, mid,
+            )
+            return
+
     try:
         log.info(
-            "AUTO TRAILING STOP: #%s %s - %s (new_stop=%.4f)",
-            trade_id, coin, reason, new_stop
+            "AUTO TRAILING STOP: #%s %s - %s (new_stop=%.6f, was=%s, fill=%.6f)",
+            trade_id, coin, reason, new_stop,
+            f"{current_stop:.6f}" if current_stop is not None else "none",
+            fill_price,
         )
-
         await state.hl.update_stop(
-            trade_id=trade_id, portal_coin=coin, side=side,
-            new_portal_stop=new_stop, portal_entry=float(entry),
+            trade_id=int(trade_id), portal_coin=coin, side=side,
+            new_portal_stop=new_stop, portal_entry=fill_price,
         )
-
         db.insert_sl_update(
-            trade_id=trade_id,
-            old_stop=opened.get("entry_sl"),
-            new_stop=new_stop,
+            trade_id=int(trade_id), old_stop=current_stop, new_stop=new_stop,
         )
-
         _push_activity(
             "stop_update",
             f"🔒 AUTO SL→{_fmt_price(new_stop)} {coin} #{trade_id} ({reason})",
-            trade_id
+            int(trade_id),
         )
-
-        log.info("AUTO TRAILING: SL updated #%s → %.4f (%s)", trade_id, new_stop, reason)
-
+        log.info("AUTO TRAILING: SL updated #%s → %.6f (%s)", trade_id, new_stop, reason)
     except Exception:
         log.exception("AUTO TRAILING: update_stop failed #%s", trade_id)
 
@@ -1083,6 +1070,90 @@ async def seed_closed_from_backlog() -> None:
     )
 
 
+def _bare(name):
+    """Strip a HIP-3 dex prefix ("xyz:SILVER" → "SILVER"). HL reports
+    positions/orders using the dex-prefixed order_name; the DB and portal
+    use the bare coin. Normalize to bare for matching."""
+    if not isinstance(name, str):
+        return name
+    return name.split(":", 1)[1] if ":" in name else name
+
+
+async def _adopt_untracked_positions(hl_positions: list[dict], only_hl: set) -> None:
+    """Re-link live HL positions the DB lost track of back to their portal
+    trades, so the bot resumes managing their TPs/stops automatically.
+
+    For each HL position whose coin isn't in the DB, recover the portal
+    trade_id from the activity feed (most recent still-open trade for that
+    coin), then insert hl_opened_trades + hl_live_trades rows using HL's real
+    entry price (= breakeven) and current resting stop. Best-effort: any
+    position we can't match to a portal trade is left untouched and logged.
+    """
+    if state.portal is None or state.hl is None:
+        return
+    try:
+        raw_events = await state.portal.get_activity_feed()
+    except Exception:
+        log.exception("adopt: could not fetch activity feed — skipping adoption")
+        return
+
+    index = build_open_trade_index(raw_events, lambda c: _bare(hl_symbol_for(c)))
+    adopted = 0
+    for p in hl_positions:
+        coin_key = _bare(p.get("coin") or "")
+        if coin_key not in only_hl:
+            continue
+        match = index.get(coin_key)
+        if match is None:
+            log.warning(
+                "adopt: %s open on HL but no matching open portal trade in feed "
+                "— cannot recover trade_id, left untouched (manual position?)",
+                coin_key,
+            )
+            continue
+        tid = int(match["trade_id"])
+        if db.get_live_trade(tid) is not None or db.get_closed_trade(tid) is not None:
+            continue  # already known
+
+        try:
+            resting_stop = await state.hl.get_resting_stop_price(p.get("coin"))
+        except Exception:
+            resting_stop = None
+
+        entry = float(p.get("entry_price") or 0.0)
+        side = (p.get("side") or match.get("side") or "long")
+        try:
+            db.insert_opened_trade(
+                trade_id=tid, coin=coin_key, side=side,
+                entry_price=entry, entry_sl=resting_stop,
+                size=float(p.get("size") or 0.0),
+                margin=state.hl.margin_usd,
+                leverage=p.get("leverage") or state.hl.default_leverage,
+                caller=match.get("caller") or "adopted",
+                my_fill_price=entry,   # HL's entryPx IS the real avg fill / BE
+            )
+            db.add_live_trade(tid)
+            adopted += 1
+            log.warning(
+                "adopt: now tracking %s as portal #%s "
+                "(entry=%s sl=%s size=%s caller=%s) — bot will manage its TPs/stops",
+                coin_key, tid, entry, resting_stop, p.get("size"), match.get("caller"),
+            )
+            _push_activity(
+                "opened",
+                f"ADOPTED {coin_key} {side.upper()} #{tid} (entry {_fmt_price(entry)})",
+                tid,
+            )
+        except Exception:
+            log.exception("adopt: failed to insert tracking for %s #%s", coin_key, tid)
+
+    if adopted:
+        log.warning(
+            "adopt: recovered %d untracked position(s) — auto-trail + TP "
+            "mirroring now active for them", adopted,
+        )
+
+
 async def reconcile_on_startup() -> None:
     """Compare HL open positions to DB live trades; log mismatches.
 
@@ -1106,14 +1177,6 @@ async def reconcile_on_startup() -> None:
             "a transient API blip"
         )
         return
-
-    # HL reports positions using order_name (prefixed for HIP-3, e.g. "xyz:SILVER").
-    # DB stores the portal coin (bare, e.g. "SILVER"). Normalize both to the
-    # bare symbol by stripping any leading "dex:" prefix so the set-diff works.
-    def _bare(name):
-        if not isinstance(name, str):
-            return name
-        return name.split(":", 1)[1] if ":" in name else name
 
     hl_coins = {_bare(p["coin"]) for p in hl_positions if p.get("coin")}
     db_live = db.list_live_trades()
@@ -1154,10 +1217,11 @@ async def reconcile_on_startup() -> None:
 
     if only_hl:
         log.warning(
-            "startup sync: HL has positions not tracked in DB: %s "
-            "(opened manually? — left untouched)",
+            "startup sync: HL has positions not tracked in DB: %s — "
+            "attempting adoption so the bot manages them",
             sorted(only_hl),
         )
+        await _adopt_untracked_positions(hl_positions, only_hl)
     if only_db:
         log.warning(
             "startup sync: DB marks live but HL has no position: %s "
