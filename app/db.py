@@ -521,6 +521,34 @@ def insert_tp_update(
     return int(cur.lastrowid)
 
 
+def get_current_stop(trade_id: int) -> Optional[float]:
+    """Return the trade's current effective stop-loss price.
+
+    Most recent `hl_sl_updates.new_stop` for the trade, falling back to the
+    opened trade's `entry_sl` if no SL update has been recorded yet. Used by
+    the auto-trail ratchet so it can compare a new trailing target against the
+    stop already in force and never loosen it.
+
+    Returns None if neither an SL update nor an entry_sl exists.
+    """
+    row = _execute(
+        """
+        SELECT new_stop FROM hl_sl_updates
+        WHERE trade_id = ? AND new_stop IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1;
+        """,
+        (int(trade_id),),
+    ).fetchone()
+    if row is not None and row["new_stop"] is not None:
+        return float(row["new_stop"])
+
+    opened = get_opened_trade(trade_id)
+    if opened is not None and opened.get("entry_sl") is not None:
+        return float(opened["entry_sl"])
+    return None
+
+
 def get_tp_update_count(trade_id: int) -> int:
     """Return how many TP-hit rows we've recorded for this trade.
 

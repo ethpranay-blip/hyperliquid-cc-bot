@@ -45,6 +45,7 @@ from app.hyperliquid_client import (
     hl_symbol_for,
 )
 from app.portal import PortalClient, PortalAuthError
+from app.trailing import compute_trailed_stop
 
 
 # ============================================================
@@ -357,32 +358,34 @@ async def _auto_trail_stop_after_tp(
     trade_id: int, coin: str, side: str, tp_num: Optional[int], opened: dict
 ) -> None:
     """
-    Automatically trail stop after TP hit per Corgi Calls rules:
-    - TP1 hit → Move stop to entry (BE)
-    - TP2 hit → Keep stop at entry (BE)
-    - TP3 hit → Move stop to TP1 price
-    - TP4 hit → Move stop to TP2 price
+    Automatically trail the stop after a TP books, per Corgi Calls rules:
+    - TP1/TP2 hit → move stop to breakeven (the ACTUAL fill price)
+    - TP3 hit     → move stop to TP1 price
+    - TP4 hit     → move stop to TP2 price
 
-    The portal often omits `tp_num` in the tp_hit event (NEAR #828 on May
-    18-19 is the canonical case: 3 TPs booked, every one with tp_num=None,
-    auto-trail silently skipped on all three). When that happens we infer
-    tp_num by counting how many TP rows already exist for this trade — and
-    since db.insert_tp_update runs before this function in handle_tp_hit,
-    the just-booked TP is included, so the count IS the inferred tp_num.
+    Three correctness guards, all added after the May 22 full-close incident:
+
+    1. BREAKEVEN = my_fill_price, NOT entry_price. entry_price stores the
+       slippage-padded LIMIT the bot sent (mid×1.05 long / mid×0.95 short).
+       Using it placed the SL on the wrong side of the fill → instant
+       stop-out the moment TP1 booked (VVV short, BTC short — May 22).
+
+    2. RATCHET (compute_trailed_stop): never loosen. Keep the tighter of
+       {tp target, current stop}. So a profit-locking stop the trader already
+       set (e.g. short @ $15.75) survives instead of being dragged back to BE.
+
+    3. VALIDITY GUARD: refuse to place an SL on the wrong side of the live mid
+       (it would trigger instantly). Belt-and-suspenders on top of (1).
+
+    Gated by AUTO_TRAIL_ENABLED (default False) until verified in production.
+    The portal usually omits tp_num; we infer it from the recorded TP count
+    (db.insert_tp_update runs before this in handle_tp_hit, so the count IS
+    this TP's ordinal).
     """
-    # ── HOTFIX (May 22): auto-trail TEMPORARILY DISABLED ──
-    # BE was computed from opened["entry_price"], which stores the
-    # slippage-padded LIMIT price (mid×1.05 long / mid×0.95 short), NOT the
-    # actual fill (my_fill_price). For a short the limit sits BELOW the fill,
-    # so the trailed SL landed below current price and HL triggered it
-    # instantly — full-closing the remaining 75% the moment TP1 booked
-    # (confirmed live on VVV short and BTC short, May 22). Partial closes and
-    # portal-driven stop_update moves are NOT affected by this gate.
-    # Re-enabled by the fill-price + ratchet fix (flip _AUTO_TRAIL_ENABLED).
     if not _AUTO_TRAIL_ENABLED:
-        log.warning(
-            "AUTO TRAILING: DISABLED (hotfix) — not moving SL for #%s tp_num=%s. "
-            "Partial close already booked; portal-driven stops remain active.",
+        log.info(
+            "AUTO TRAILING: disabled (AUTO_TRAIL_ENABLED unset) — skip #%s "
+            "tp_num=%s. Partial close booked; portal stops remain active.",
             trade_id, tp_num,
         )
         return
@@ -391,6 +394,7 @@ async def _auto_trail_stop_after_tp(
         log.warning("AUTO TRAILING: skip #%s — HL client not ready", trade_id)
         return
 
+    # Infer tp_num when the portal omits it.
     if tp_num is None:
         inferred = db.get_tp_update_count(int(trade_id))
         if inferred < 1:
@@ -405,79 +409,76 @@ async def _auto_trail_stop_after_tp(
         )
         tp_num = inferred
 
-    entry = opened.get("entry_price")
-    if entry is None:
-        log.warning("AUTO TRAILING: skip #%s — entry_price missing in DB", trade_id)
-        return
-
-    # Determine new stop based on TP number
-    new_stop = None
-
-    if tp_num in (1, 2):
-        # TP1 or TP2 hit → move to breakeven
-        new_stop = float(entry)
-        reason = f"TP{tp_num} hit → BE"
-
-    elif tp_num == 3:
-        # TP3 hit → move to TP1 price (looked up from hl_tp_updates,
-        # since hl_opened_trades does not persist TP levels).
-        tp1_price = db.get_tp_price_from_history(trade_id, tp_num=1)
-        if tp1_price is not None:
-            new_stop = float(tp1_price)
-            reason = "TP3 hit → TP1"
-        else:
-            log.warning(
-                "AUTO TRAILING: TP3 hit on #%s but no TP1 row in hl_tp_updates "
-                "— SL not moved (was the bot offline when TP1 hit?)",
-                trade_id,
-            )
-
-    elif tp_num == 4:
-        # TP4 hit → move to TP2 price (same lookup path as TP3 → TP1).
-        tp2_price = db.get_tp_price_from_history(trade_id, tp_num=2)
-        if tp2_price is not None:
-            new_stop = float(tp2_price)
-            reason = "TP4 hit → TP2"
-        else:
-            log.warning(
-                "AUTO TRAILING: TP4 hit on #%s but no TP2 row in hl_tp_updates "
-                "— SL not moved (was the bot offline when TP2 hit?)",
-                trade_id,
-            )
-
-    if new_stop is None:
+    # Guard 1: breakeven basis = REAL fill, not the limit price.
+    fill_price = opened.get("my_fill_price")
+    if fill_price in (None, ""):
+        fill_price = opened.get("entry_price")
         log.warning(
-            "AUTO TRAILING: skip #%s — new_stop unresolved (tp_num=%s)",
-            trade_id, tp_num,
+            "AUTO TRAILING: #%s has no my_fill_price — falling back to "
+            "entry_price (limit) for BE; trail may be slightly off", trade_id,
         )
+    if fill_price in (None, ""):
+        log.warning("AUTO TRAILING: skip #%s — no fill or entry price in DB", trade_id)
+        return
+    fill_price = float(fill_price)
+
+    is_long = side.lower() in ("long", "buy")
+    current_stop = db.get_current_stop(int(trade_id))
+    tp1_price = db.get_tp_price_from_history(int(trade_id), tp_num=1)
+    tp2_price = db.get_tp_price_from_history(int(trade_id), tp_num=2)
+
+    # Guard 2: rule target + never-loosen ratchet (pure, tested in app/trailing).
+    new_stop, reason = compute_trailed_stop(
+        is_long=is_long, tp_num=int(tp_num), fill_price=fill_price,
+        current_stop=current_stop, tp1_price=tp1_price, tp2_price=tp2_price,
+    )
+    if new_stop is None:
+        log.warning("AUTO TRAILING: skip #%s — %s", trade_id, reason)
         return
 
-    # Update stop on Hyperliquid
+    # Guard 3: never place an SL on the wrong side of the live mid (would
+    # trigger instantly). If mid is unavailable, proceed — the my_fill_price
+    # basis already prevents the original failure mode.
+    try:
+        mid = await state.hl.get_price_for_pricing(coin)
+    except Exception:
+        mid = None
+    if mid is not None and mid > 0:
+        if is_long and new_stop >= mid:
+            log.warning(
+                "AUTO TRAILING: skip #%s — long SL %.6f >= mid %.6f "
+                "(would trigger instantly); leaving existing stop in place",
+                trade_id, new_stop, mid,
+            )
+            return
+        if (not is_long) and new_stop <= mid:
+            log.warning(
+                "AUTO TRAILING: skip #%s — short SL %.6f <= mid %.6f "
+                "(would trigger instantly); leaving existing stop in place",
+                trade_id, new_stop, mid,
+            )
+            return
+
     try:
         log.info(
-            "AUTO TRAILING STOP: #%s %s - %s (new_stop=%.4f)",
-            trade_id, coin, reason, new_stop
+            "AUTO TRAILING STOP: #%s %s - %s (new_stop=%.6f, was=%s, fill=%.6f)",
+            trade_id, coin, reason, new_stop,
+            f"{current_stop:.6f}" if current_stop is not None else "none",
+            fill_price,
         )
-
         await state.hl.update_stop(
-            trade_id=trade_id, portal_coin=coin, side=side,
-            new_portal_stop=new_stop, portal_entry=float(entry),
+            trade_id=int(trade_id), portal_coin=coin, side=side,
+            new_portal_stop=new_stop, portal_entry=fill_price,
         )
-
         db.insert_sl_update(
-            trade_id=trade_id,
-            old_stop=opened.get("entry_sl"),
-            new_stop=new_stop,
+            trade_id=int(trade_id), old_stop=current_stop, new_stop=new_stop,
         )
-
         _push_activity(
             "stop_update",
             f"🔒 AUTO SL→{_fmt_price(new_stop)} {coin} #{trade_id} ({reason})",
-            trade_id
+            int(trade_id),
         )
-
-        log.info("AUTO TRAILING: SL updated #%s → %.4f (%s)", trade_id, new_stop, reason)
-
+        log.info("AUTO TRAILING: SL updated #%s → %.6f (%s)", trade_id, new_stop, reason)
     except Exception:
         log.exception("AUTO TRAILING: update_stop failed #%s", trade_id)
 
