@@ -331,6 +331,9 @@ class Notifier:
             "stale": "🕰️",
             "blocked_coin_live": "🚫",
             "insufficient_margin": "💸",
+            "entry_slipped": "🎯",
+            "tp_slipped": "🎯",
+            "close_slipped": "🎯",
         }.get(reason, "⚠️")
         header = f"{icon} TRADE SKIPPED"
         lines = [header]

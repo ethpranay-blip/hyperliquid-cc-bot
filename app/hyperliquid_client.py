@@ -57,6 +57,12 @@ except ImportError:  # pragma: no cover
 
 from app import db
 from app.sizing import compute_position_size
+from app.execution import (
+    LevelSlippageExceeded,
+    enforce_slip,
+    get_default_slip_pct,
+    slippage_capped_limit,
+)
 
 log = logging.getLogger(__name__)
 
@@ -817,9 +823,29 @@ class HyperliquidClient:
         except ValueError as exc:
             raise HyperliquidValidationError(str(exc))
 
-        # Entry limit with ±slippage, IOC
-        slip_mul = (1 + slippage) if is_buy else (1 - slippage)
-        entry_px = round_px(mid * slip_mul, sz_dec)
+        # Entry limit: STRICT slippage cap vs the caller's posted entry.
+        # For non-k coins (where portal_entry and HL mid share price space),
+        # the IOC's own limit price is set to caller_entry ± slip_pct so HL's
+        # matching engine itself enforces the discipline (out-of-range → no
+        # fill → LevelSlippageExceeded → enter_trade skips & notifies).
+        # k-coins use a different magnitude on HL (kPEPE = 1000×PEPE) so
+        # comparing portal_entry to HL mid would be wrong — fall back to the
+        # legacy mid-based cushion for those.
+        slip_pct = get_default_slip_pct()
+        if portal_entry is not None and portal_entry > 0 and not is_k_coin(portal_coin):
+            enforce_slip(
+                action="entry", mid=mid, level=float(portal_entry),
+                is_buy=is_buy, slip_pct=slip_pct,
+            )
+            entry_px = round_px(
+                slippage_capped_limit(
+                    level=float(portal_entry), is_buy=is_buy, slip_pct=slip_pct,
+                ),
+                sz_dec,
+            )
+        else:
+            slip_mul = (1 + slippage) if is_buy else (1 - slippage)
+            entry_px = round_px(mid * slip_mul, sz_dec)
 
         entry_cloid = cloid_for(trade_id)
         sl_cloid = sl_cloid_for(trade_id) if sl_px is not None else None
@@ -961,11 +987,19 @@ class HyperliquidClient:
         portal_coin: str,
         side: str,
         size: Optional[float] = None,
+        target_level: Optional[float] = None,
     ) -> CloseResult:
-        """Full-size market close, reduce-only."""
+        """Full-size market close, reduce-only.
+
+        `target_level`, when provided, is the caller-posted close price (or SL
+        level). The order's IOC limit is hard-capped at ±slip_pct from this
+        level, and if current mid is outside the cap, LevelSlippageExceeded
+        is raised instead of submitting (caller skips & notifies).
+        """
         return await self._close_common(
             trade_id=trade_id, portal_coin=portal_coin, side=side,
             size=size, size_pct=100.0, is_partial=False,
+            target_level=target_level,
         )
 
     async def partial_tp(
@@ -976,8 +1010,14 @@ class HyperliquidClient:
         side: str,
         size_pct: float,
         current_size: Optional[float] = None,
+        target_level: Optional[float] = None,
     ) -> CloseResult:
-        """Close (size_pct/100) * current_size of the position."""
+        """Close (size_pct/100) * current_size of the position.
+
+        `target_level` is the caller's posted TP price. Same strict-slippage
+        contract as close_trade — IOC limit capped at ±slip_pct from TP price,
+        or LevelSlippageExceeded.
+        """
         if size_pct <= 0 or size_pct >= 100:
             raise HyperliquidValidationError(
                 f"partial_tp size_pct must be in (0,100), got {size_pct}"
@@ -985,11 +1025,13 @@ class HyperliquidClient:
         return await self._close_common(
             trade_id=trade_id, portal_coin=portal_coin, side=side,
             size=current_size, size_pct=size_pct, is_partial=True,
+            target_level=target_level,
         )
 
     async def _close_common(
         self, *, trade_id: int, portal_coin: str, side: str,
         size: Optional[float], size_pct: float, is_partial: bool,
+        target_level: Optional[float] = None,
     ) -> CloseResult:
         side_l = side.lower()
         is_buy_original = side_l in ("long", "buy")
@@ -1016,9 +1058,28 @@ class HyperliquidClient:
         if mid is None or mid <= 0:
             raise HyperliquidValidationError(f"no mid for {order_name}")
 
-        # Market-IOC is a limit with aggressive price past the mid
-        slip_mul = 1.05 if exit_is_buy else 0.95
-        limit_px = round_px(mid * slip_mul, sz_dec)
+        # STRICT slippage cap vs caller's target_level (TP price or close
+        # price). If price has moved outside the cap, raise so the caller
+        # logs a skip and we notify — better than booking a partial/close at
+        # a worse price than the caller's actual fill. Skipped for k-coins
+        # (different price magnitude on HL — legacy cushion handles those).
+        slip_pct = get_default_slip_pct()
+        if target_level is not None and target_level > 0 and not is_k_coin(portal_coin):
+            enforce_slip(
+                action=("tp" if is_partial else "close"),
+                mid=mid, level=float(target_level),
+                is_buy=exit_is_buy, slip_pct=slip_pct,
+            )
+            limit_px = round_px(
+                slippage_capped_limit(
+                    level=float(target_level), is_buy=exit_is_buy, slip_pct=slip_pct,
+                ),
+                sz_dec,
+            )
+        else:
+            # Legacy aggressive cushion (manual cancels and k-coins go here).
+            slip_mul = 1.05 if exit_is_buy else 0.95
+            limit_px = round_px(mid * slip_mul, sz_dec)
 
         log.info(
             "%s %s #%s sz=%s mid=%s limit=%s dry_run=%s",
