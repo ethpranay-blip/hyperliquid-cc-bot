@@ -21,30 +21,57 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-# Default cap; per-deploy override via env, per-trade override via setting.
-DEFAULT_MAX_LEVEL_SLIPPAGE_PCT = 0.005  # 0.5%
+# Per-action default caps. Two-tier policy:
+#   ENTRY + SL  → 0.5%  — precision matters most (avoid bad fills / late closes)
+#   TP / profit → 1.0%  — booking a winner at 1% off is still a winner
+# Per-deploy override via env vars; future dashboard exposure planned.
+DEFAULT_ENTRY_SLIP_PCT = 0.005   # 0.5%
+DEFAULT_TP_SLIP_PCT    = 0.010   # 1.0%
+DEFAULT_SL_SLIP_PCT    = 0.005   # 0.5%  (HL's resting SL trigger is the safety net)
+
+# Back-compat alias (kept so older callers still import).
+DEFAULT_MAX_LEVEL_SLIPPAGE_PCT = DEFAULT_ENTRY_SLIP_PCT
 
 
-def get_default_slip_pct() -> float:
-    """Read MAX_LEVEL_SLIPPAGE_PCT from env, falling back to 0.5%.
-
-    Accepts either a decimal (0.005) or a percentage-looking value (0.5 →
-    treated as 0.5%, i.e. 0.005). Values > 0.5 are clamped at 0.5 (50%) as a
-    sanity guard against a typo making the cap a no-op.
+def _read_env_slip(env_var: str, default: float) -> float:
+    """Parse a slip-pct env var. Accepts a decimal (0.005) or a
+    percentage-looking value (0.5 → 0.005). Garbage / non-positive →
+    default. Clamped at 0.5 (50%) so a typo can't make the cap a no-op.
     """
-    raw = os.environ.get("MAX_LEVEL_SLIPPAGE_PCT", "").strip()
+    raw = os.environ.get(env_var, "").strip()
     if not raw:
-        return DEFAULT_MAX_LEVEL_SLIPPAGE_PCT
+        return default
     try:
         v = float(raw)
     except (ValueError, TypeError):
-        return DEFAULT_MAX_LEVEL_SLIPPAGE_PCT
-    # Heuristic: >= 1 likely means "5" meaning "5%" → 0.05.
+        return default
     if v >= 1:
         v = v / 100.0
     if v <= 0:
-        return DEFAULT_MAX_LEVEL_SLIPPAGE_PCT
+        return default
     return min(v, 0.5)
+
+
+def get_entry_slip_pct() -> float:
+    """Cap for new-trade entries (long buy / short sell). Default 0.5%."""
+    return _read_env_slip("MAX_ENTRY_SLIPPAGE_PCT", DEFAULT_ENTRY_SLIP_PCT)
+
+
+def get_tp_slip_pct() -> float:
+    """Cap for partial-TP fills and manual profit-booking closes. Default 1.0%."""
+    return _read_env_slip("MAX_TP_SLIPPAGE_PCT", DEFAULT_TP_SLIP_PCT)
+
+
+def get_sl_slip_pct() -> float:
+    """Cap for SL-triggered full closes. Default 0.5%. HL's own resting SL
+    trigger is the safety net if the bot's market-close misses the cap."""
+    return _read_env_slip("MAX_SL_SLIPPAGE_PCT", DEFAULT_SL_SLIP_PCT)
+
+
+def get_default_slip_pct() -> float:
+    """Back-compat for callers that don't yet specify per-action cap.
+    Returns the ENTRY cap (the conservative choice)."""
+    return get_entry_slip_pct()
 
 
 class LevelSlippageExceeded(Exception):

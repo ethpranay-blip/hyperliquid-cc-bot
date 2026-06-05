@@ -60,7 +60,8 @@ from app.sizing import compute_position_size
 from app.execution import (
     LevelSlippageExceeded,
     enforce_slip,
-    get_default_slip_pct,
+    get_entry_slip_pct,
+    get_tp_slip_pct,
     slippage_capped_limit,
 )
 
@@ -779,6 +780,7 @@ class HyperliquidClient:
         margin_usd: Optional[float] = None,
         risk_usd: Optional[float] = None,
         available_margin: Optional[float] = None,
+        slip_pct: Optional[float] = None,
     ) -> OpenResult:
         side_l = side.lower()
         if side_l not in ("long", "short", "buy", "sell"):
@@ -831,7 +833,7 @@ class HyperliquidClient:
         # k-coins use a different magnitude on HL (kPEPE = 1000×PEPE) so
         # comparing portal_entry to HL mid would be wrong — fall back to the
         # legacy mid-based cushion for those.
-        slip_pct = get_default_slip_pct()
+        slip_pct = slip_pct if slip_pct is not None else get_entry_slip_pct()
         if portal_entry is not None and portal_entry > 0 and not is_k_coin(portal_coin):
             enforce_slip(
                 action="entry", mid=mid, level=float(portal_entry),
@@ -988,18 +990,20 @@ class HyperliquidClient:
         side: str,
         size: Optional[float] = None,
         target_level: Optional[float] = None,
+        slip_pct: Optional[float] = None,
     ) -> CloseResult:
         """Full-size market close, reduce-only.
 
         `target_level`, when provided, is the caller-posted close price (or SL
-        level). The order's IOC limit is hard-capped at ±slip_pct from this
-        level, and if current mid is outside the cap, LevelSlippageExceeded
-        is raised instead of submitting (caller skips & notifies).
+        level). `slip_pct` is the cap vs that level — if None, the TP cap
+        (1%) applies, which is appropriate for manual / profit-booking
+        closes. SL-triggered closes should pass the tighter SL cap (0.5%)
+        explicitly.
         """
         return await self._close_common(
             trade_id=trade_id, portal_coin=portal_coin, side=side,
             size=size, size_pct=100.0, is_partial=False,
-            target_level=target_level,
+            target_level=target_level, slip_pct=slip_pct,
         )
 
     async def partial_tp(
@@ -1011,12 +1015,13 @@ class HyperliquidClient:
         size_pct: float,
         current_size: Optional[float] = None,
         target_level: Optional[float] = None,
+        slip_pct: Optional[float] = None,
     ) -> CloseResult:
         """Close (size_pct/100) * current_size of the position.
 
-        `target_level` is the caller's posted TP price. Same strict-slippage
-        contract as close_trade — IOC limit capped at ±slip_pct from TP price,
-        or LevelSlippageExceeded.
+        `target_level` is the caller's posted TP price. `slip_pct` defaults to
+        the TP cap (1%) when None — booking a winner at 1% off is still a
+        winner, so we're more lenient here than on entries.
         """
         if size_pct <= 0 or size_pct >= 100:
             raise HyperliquidValidationError(
@@ -1025,13 +1030,14 @@ class HyperliquidClient:
         return await self._close_common(
             trade_id=trade_id, portal_coin=portal_coin, side=side,
             size=current_size, size_pct=size_pct, is_partial=True,
-            target_level=target_level,
+            target_level=target_level, slip_pct=slip_pct,
         )
 
     async def _close_common(
         self, *, trade_id: int, portal_coin: str, side: str,
         size: Optional[float], size_pct: float, is_partial: bool,
         target_level: Optional[float] = None,
+        slip_pct: Optional[float] = None,
     ) -> CloseResult:
         side_l = side.lower()
         is_buy_original = side_l in ("long", "buy")
@@ -1059,11 +1065,11 @@ class HyperliquidClient:
             raise HyperliquidValidationError(f"no mid for {order_name}")
 
         # STRICT slippage cap vs caller's target_level (TP price or close
-        # price). If price has moved outside the cap, raise so the caller
-        # logs a skip and we notify — better than booking a partial/close at
-        # a worse price than the caller's actual fill. Skipped for k-coins
-        # (different price magnitude on HL — legacy cushion handles those).
-        slip_pct = get_default_slip_pct()
+        # price). slip_pct is provided by the caller — TPs use the lenient
+        # cap (1%), SL-triggered closes use the tight cap (0.5%); when not
+        # provided we default to the TP cap (matches manual / profit-booking
+        # closes). Skipped for k-coins (different HL price magnitude).
+        slip_pct = slip_pct if slip_pct is not None else get_tp_slip_pct()
         if target_level is not None and target_level > 0 and not is_k_coin(portal_coin):
             enforce_slip(
                 action=("tp" if is_partial else "close"),

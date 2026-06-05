@@ -44,7 +44,9 @@ from app.hyperliquid_client import (
     HyperliquidClient, HyperliquidError, HyperliquidValidationError,
     hl_symbol_for, MIN_NOTIONAL_USD,
 )
-from app.execution import LevelSlippageExceeded
+from app.execution import (
+    LevelSlippageExceeded, get_sl_slip_pct, get_tp_slip_pct,
+)
 from app.portal import PortalClient, PortalAuthError
 from app.trailing import compute_trailed_stop
 from app.adoption import build_open_trade_index
@@ -653,10 +655,15 @@ async def handle_full_close(event: dict) -> None:
     except (ValueError, TypeError):
         close_level = None
 
+    # Tighter cap when an SL fired (precision matters; HL's own SL trigger
+    # is the safety net if we miss). More lenient for vob's manual exit
+    # (a winner at 1% off the called exit is still a winner).
+    close_slip = get_sl_slip_pct() if stop_triggered else get_tp_slip_pct()
+
     try:
         result = await state.hl.close_trade(
             trade_id=int(trade_id), portal_coin=coin, side=side,
-            target_level=close_level,
+            target_level=close_level, slip_pct=close_slip,
         )
         _finalize_close(
             int(trade_id), opened, result,
