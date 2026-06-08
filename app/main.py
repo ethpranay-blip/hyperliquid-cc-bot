@@ -44,6 +44,9 @@ from app.hyperliquid_client import (
     HyperliquidClient, HyperliquidError, HyperliquidValidationError,
     hl_symbol_for, MIN_NOTIONAL_USD,
 )
+from app.execution import (
+    LevelSlippageExceeded, get_sl_slip_pct, get_tp_slip_pct,
+)
 from app.portal import PortalClient, PortalAuthError
 from app.trailing import compute_trailed_stop
 from app.adoption import build_open_trade_index
@@ -552,17 +555,21 @@ async def handle_tp_hit(event: dict) -> None:
     if state.hl is None:
         return
 
+    # Caller-posted TP price → used as the strict slippage cap reference.
+    tp_level = float(tp_price) if tp_price is not None else None
+
     try:
         if float(size_pct) >= 100:
             # Treated as full close
             result = await state.hl.close_trade(
                 trade_id=int(trade_id), portal_coin=coin, side=side,
+                target_level=tp_level,
             )
             _finalize_close(int(trade_id), opened, result, close_type="automatic")
         else:
             result = await state.hl.partial_tp(
                 trade_id=int(trade_id), portal_coin=coin, side=side,
-                size_pct=float(size_pct),
+                size_pct=float(size_pct), target_level=tp_level,
             )
             db.insert_tp_update(
                 trade_id=int(trade_id),
@@ -583,6 +590,28 @@ async def handle_tp_hit(event: dict) -> None:
                 tp_num=tp_num, opened=opened
             )
 
+    except LevelSlippageExceeded as exc:
+        log.warning(
+            "TP SLIPPED #%s %s — mid=%g vs tp_level=%g drift=%.2f%% cap=%.2f%% "
+            "(partial NOT booked; position stays full size)",
+            trade_id, coin, exc.mid, exc.level,
+            exc.drift_pct * 100, exc.slip_pct * 100,
+        )
+        _push_activity(
+            "blocked",
+            f"🎯 TP SLIPPED {coin} #{trade_id} (mid {_fmt_price(exc.mid)} vs "
+            f"tp {_fmt_price(exc.level)}, drift {exc.drift_pct*100:.2f}%)",
+            int(trade_id),
+        )
+        notifier.notify_skipped(
+            coin=coin, side=side, reason="tp_slipped",
+            caller=opened.get("caller"), trade_id=int(trade_id),
+            detail=(
+                f"mid {_fmt_price(exc.mid)} vs TP {_fmt_price(exc.level)} "
+                f"({exc.drift_pct*100:.2f}% drift > {exc.slip_pct*100:.2f}% cap) "
+                f"— partial not booked"
+            ),
+        )
     except HyperliquidValidationError as exc:
         log.warning("TP execution rejected #%s: %s", trade_id, exc)
     except Exception:
@@ -619,13 +648,50 @@ async def handle_full_close(event: dict) -> None:
     if state.hl is None:
         return
 
+    # Caller-posted exit price → strict slippage cap reference.
+    close_level = event.get("exit_price")
+    try:
+        close_level = float(close_level) if close_level is not None else None
+    except (ValueError, TypeError):
+        close_level = None
+
+    # Tighter cap when an SL fired (precision matters; HL's own SL trigger
+    # is the safety net if we miss). More lenient for vob's manual exit
+    # (a winner at 1% off the called exit is still a winner).
+    close_slip = get_sl_slip_pct() if stop_triggered else get_tp_slip_pct()
+
     try:
         result = await state.hl.close_trade(
             trade_id=int(trade_id), portal_coin=coin, side=side,
+            target_level=close_level, slip_pct=close_slip,
         )
         _finalize_close(
             int(trade_id), opened, result,
             close_type="stop_triggered" if stop_triggered else "automatic",
+        )
+    except LevelSlippageExceeded as exc:
+        # Mid moved past the close-cap. Position remains OPEN. HL's own SL
+        # trigger (placed at open) is the safety net for runaway losses.
+        log.warning(
+            "CLOSE SLIPPED #%s %s — mid=%g vs close_level=%g drift=%.2f%% cap=%.2f%% "
+            "(position remains open; HL-side SL trigger is the safety net)",
+            trade_id, coin, exc.mid, exc.level,
+            exc.drift_pct * 100, exc.slip_pct * 100,
+        )
+        _push_activity(
+            "blocked",
+            f"🎯 CLOSE SLIPPED {coin} #{trade_id} (mid {_fmt_price(exc.mid)} vs "
+            f"close {_fmt_price(exc.level)}, drift {exc.drift_pct*100:.2f}%)",
+            int(trade_id),
+        )
+        notifier.notify_skipped(
+            coin=coin, side=side, reason="close_slipped",
+            caller=opened.get("caller"), trade_id=int(trade_id),
+            detail=(
+                f"mid {_fmt_price(exc.mid)} vs close {_fmt_price(exc.level)} "
+                f"({exc.drift_pct*100:.2f}% drift > {exc.slip_pct*100:.2f}% cap) "
+                f"— position still open"
+            ),
         )
     except HyperliquidValidationError as exc:
         log.warning("close rejected #%s (likely already closed): %s", trade_id, exc)
@@ -779,6 +845,30 @@ async def enter_trade(trade_id: int) -> None:
             sizing_mode=mode, margin_usd=margin_usd, risk_usd=risk_usd,
             available_margin=available,
         )
+    except LevelSlippageExceeded as exc:
+        # Caller's entry is too far from current mid — refuse to chase.
+        log.warning(
+            "ENTRY SLIPPED #%s %s — mid=%g vs called=%g drift=%.2f%% cap=%.2f%%",
+            trade_id, coin, exc.mid, exc.level,
+            exc.drift_pct * 100, exc.slip_pct * 100,
+        )
+        _push_activity(
+            "blocked",
+            f"🎯 SLIPPED {coin} #{trade_id} (mid {_fmt_price(exc.mid)} vs "
+            f"called {_fmt_price(exc.level)}, drift {exc.drift_pct*100:.2f}%)",
+            int(trade_id),
+        )
+        notifier.notify_skipped(
+            coin=coin, side=side, reason="entry_slipped", caller=caller,
+            trade_id=int(trade_id),
+            detail=(
+                f"mid {_fmt_price(exc.mid)} vs called {_fmt_price(exc.level)} "
+                f"({exc.drift_pct*100:.2f}% drift > {exc.slip_pct*100:.2f}% cap)"
+            ),
+        )
+        state.pending_trades.pop(int(trade_id), None)
+        state.fire_refresh()
+        return
     except HyperliquidValidationError as exc:
         _safe_notify(f"Open rejected #{trade_id}: {exc}", "negative")
         return
