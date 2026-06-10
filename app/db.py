@@ -530,6 +530,23 @@ def insert_tp_update(
     return int(cur.lastrowid)
 
 
+def list_all_opened_trades(limit: int = 10000) -> list[dict]:
+    """All-time list of opened-trade rows (one row per (trade_id, open event).
+
+    Used by the performance report so it can reach closed/orphan trades even
+    when they're no longer in hl_live_trades.
+    """
+    rows = _execute(
+        """
+        SELECT * FROM hl_opened_trades
+        ORDER BY id DESC
+        LIMIT ?;
+        """,
+        (int(limit),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_current_stop(trade_id: int) -> Optional[float]:
     """Return the trade's current effective stop-loss price.
 
