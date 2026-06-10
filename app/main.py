@@ -47,6 +47,12 @@ from app.hyperliquid_client import (
 from app.execution import (
     LevelSlippageExceeded, get_sl_slip_pct, get_tp_slip_pct,
 )
+from app.performance import (
+    reconcile as _perf_reconcile,
+    summarize as _perf_summarize,
+    STATUS_COPIED_CLOSED, STATUS_MISSED, STATUS_COPIED_OPEN,
+    STATUS_COPIED_ORPHAN, STATUS_BOT_ONLY,
+)
 from app.portal import PortalClient, PortalAuthError
 from app.trailing import compute_trailed_stop
 from app.adoption import build_open_trade_index
@@ -1592,6 +1598,10 @@ def index() -> None:
                     type="info",
                 )
             auto_switch.on("update:model-value", _toggle_auto)
+            ui.button(
+                "📊 Performance",
+                on_click=lambda: ui.navigate.to("/performance"),
+            ).props("flat color=primary")
             if state.dry_run:
                 ui.label("DRY RUN").classes("dry-banner")
 
@@ -1781,6 +1791,261 @@ def index() -> None:
 
     ui.timer(1.0, tick_fast)
     ui.timer(3.0, tick_slow)
+
+
+# ============================================================
+# SECTION: Performance comparison page (/performance)
+# ============================================================
+
+@ui.page("/performance")
+async def performance_page() -> None:
+    ui.add_head_html(
+        "<style>"
+        ".perf-metric { background: #1a202c; color: #e2e8f0; padding: 14px 18px; "
+        "  border-radius: 10px; min-width: 180px; }"
+        ".perf-metric .label { font-size: 11px; opacity: 0.65; text-transform: uppercase; }"
+        ".perf-metric .value { font-size: 24px; font-weight: 700; margin-top: 4px; }"
+        ".perf-metric .sub { font-size: 11px; opacity: 0.6; margin-top: 2px; }"
+        ".perf-pos { color: #48bb78; }   .perf-neg { color: #fc8181; }"
+        ".perf-caveat { background: #44391a; color: #faf0c6; padding: 12px 16px; "
+        "  border-radius: 8px; font-size: 12px; line-height: 1.5; }"
+        "</style>"
+    )
+
+    with ui.header().classes("items-center justify-between"):
+        ui.label("📊 Performance vs Portal").classes("text-lg font-bold")
+        with ui.row().classes("items-center gap-2"):
+            ui.button("← Dashboard", on_click=lambda: ui.navigate.to("/")).props("flat")
+            ui.button(
+                "⟳ Refresh", on_click=lambda: ui.navigate.reload(),
+            ).props("flat color=primary")
+
+    container = ui.column().classes("w-full p-4 gap-4")
+    with container:
+        ui.label("Loading portal feed + bot history…").classes("text-base opacity-70")
+
+    # ---- gather data ----
+    try:
+        portal_events: list[dict] = []
+        if state.portal is not None:
+            try:
+                portal_events = await state.portal.get_activity_feed()
+            except Exception:
+                log.exception("performance: portal feed fetch failed")
+                portal_events = []
+
+        bot_opens = db.list_all_opened_trades(limit=10000)
+        bot_closeds = db.get_historic_trades(limit=10000)
+        bot_live_ids = {int(t["trade_id"]) for t in db.list_live_trades()
+                        if t.get("trade_id") is not None}
+
+        allowed_raw = os.environ.get(
+            "ALLOWED_CALLERS", "voberoi,pranayyyy,corgil_",
+        )
+        allowed_callers = {
+            c.strip().lower() for c in allowed_raw.split(",") if c.strip()
+        }
+
+        sizing = db.get_sizing_settings(
+            default_margin_usd=state.hl.margin_usd if state.hl else 100.0,
+        )
+        per_trade_margin = float(sizing.get("margin_usd") or 100.0)
+
+        reconciled = _perf_reconcile(
+            portal_events=portal_events,
+            bot_opens=bot_opens, bot_closeds=bot_closeds,
+            bot_live_ids=bot_live_ids,
+            allowed_callers=allowed_callers,
+        )
+        summary = _perf_summarize(
+            reconciled, per_trade_margin_usd=per_trade_margin,
+        )
+    except Exception as exc:
+        container.clear()
+        with container:
+            ui.label("Failed to build report.").classes("text-red-400 font-bold")
+            ui.label(str(exc)).classes("text-sm opacity-70")
+        log.exception("performance page: build failed")
+        return
+
+    container.clear()
+
+    def _signed(usd: Optional[float]) -> str:
+        if usd is None:
+            return "—"
+        sign = "+" if usd >= 0 else "-"
+        return f"{sign}${abs(usd):,.2f}"
+
+    def _signed_cls(usd: Optional[float]) -> str:
+        if usd is None or usd == 0:
+            return ""
+        return "perf-pos" if usd > 0 else "perf-neg"
+
+    def _metric(label: str, value_html: str, subtitle: str = "", cls: str = "") -> None:
+        with ui.element("div").classes("perf-metric"):
+            ui.label(label).classes("label")
+            ui.html(f'<div class="value {cls}">{value_html}</div>')
+            if subtitle:
+                ui.label(subtitle).classes("sub")
+
+    with container:
+        # Caveats
+        with ui.element("div").classes("perf-caveat w-full"):
+            ui.html(
+                "<strong>How to read this:</strong> Bot data is from your live SQLite "
+                "(<code>hl_closed_trades</code> minus pre-seeded). Portal data is from "
+                "the current activity feed window — older closes may have rolled off. "
+                "<strong>Portal hypothetical $</strong> = "
+                f"<code>${per_trade_margin:.0f} × pnl%</code> per trade (perp ROI on "
+                "margin). <strong>Bot actual $</strong> is realized PnL after fees on HL. "
+                "Only <em>closed</em> trades count for performance; open positions aren't "
+                "included (no unrealized PnL shown)."
+            )
+
+        # Headline: direct apples-to-apples comparison
+        ui.label("Direct comparison — trades present on both sides").classes("text-base font-semibold")
+        with ui.row().classes("gap-3 flex-wrap"):
+            _metric(
+                "Portal hypothetical",
+                _signed(summary["direct_portal_usd"]),
+                f"{summary['direct_count']} matched trades",
+                _signed_cls(summary["direct_portal_usd"]),
+            )
+            _metric(
+                "Bot actual",
+                _signed(summary["direct_bot_usd"]),
+                "after fees",
+                _signed_cls(summary["direct_bot_usd"]),
+            )
+            _metric(
+                "Difference (bot − portal)",
+                _signed(summary["direct_diff_usd"]),
+                "negative = bot underperformed",
+                _signed_cls(summary["direct_diff_usd"]),
+            )
+
+        # Wider totals
+        ui.label("Wider totals — full window each side").classes("text-base font-semibold mt-2")
+        with ui.row().classes("gap-3 flex-wrap"):
+            _metric(
+                f"Portal — {summary['portal_completed_count']} completed",
+                _signed(summary["portal_total_usd"]),
+                f"win rate {summary['portal_win_rate']*100:.0f}%",
+                _signed_cls(summary["portal_total_usd"]),
+            )
+            _metric(
+                f"Bot — {summary['bot_closed_count']} closed",
+                _signed(summary["bot_total_usd"]),
+                f"fees ${summary['bot_fees_usd']:.2f} · win rate {summary['bot_win_rate']*100:.0f}%",
+                _signed_cls(summary["bot_total_usd"]),
+            )
+
+        # Status breakdown
+        ui.label("Trade status breakdown").classes("text-base font-semibold mt-2")
+        with ui.row().classes("gap-3 flex-wrap"):
+            labels = {
+                STATUS_COPIED_CLOSED: "Copied + closed",
+                STATUS_COPIED_OPEN: "Copied (still open)",
+                STATUS_COPIED_ORPHAN: "Copied (orphan)",
+                STATUS_MISSED: "Missed (portal had it, bot didn't)",
+                STATUS_BOT_ONLY: "Bot-only (portal feed rolled off)",
+            }
+            for status, label in labels.items():
+                count = summary["status_counts"].get(status, 0)
+                if count == 0:
+                    continue
+                with ui.element("div").classes("perf-metric"):
+                    ui.label(label).classes("label")
+                    ui.html(f'<div class="value">{count}</div>')
+
+        # Per-caller chart
+        ui.label("Performance by caller").classes("text-base font-semibold mt-2")
+        callers = summary["by_caller"]
+        if callers:
+            try:
+                ui.echart({
+                    "tooltip": {"trigger": "axis"},
+                    "legend": {"data": ["Portal hypothetical $", "Bot actual $"],
+                               "textStyle": {"color": "#e2e8f0"}},
+                    "grid": {"left": 60, "right": 30, "top": 50, "bottom": 40},
+                    "xAxis": {
+                        "type": "category",
+                        "data": [c["caller"] for c in callers],
+                        "axisLabel": {"color": "#e2e8f0"},
+                    },
+                    "yAxis": {
+                        "type": "value",
+                        "axisLabel": {"color": "#e2e8f0", "formatter": "${value}"},
+                    },
+                    "series": [
+                        {"name": "Portal hypothetical $", "type": "bar",
+                         "itemStyle": {"color": "#63b3ed"},
+                         "data": [round(c["portal_pnl_usd"], 2) for c in callers]},
+                        {"name": "Bot actual $", "type": "bar",
+                         "itemStyle": {"color": "#f6ad55"},
+                         "data": [round(c["bot_pnl_usd"], 2) for c in callers]},
+                    ],
+                }).classes("w-full").style("height: 320px;")
+            except Exception:
+                # ui.echart may not be available in older NiceGUI — fall back to
+                # a simple table so the page still renders.
+                log.debug("ui.echart unavailable, using table fallback", exc_info=True)
+                _caller_rows = [{
+                    "caller": c["caller"],
+                    "portal_pnl": _signed(c["portal_pnl_usd"]),
+                    "bot_pnl": _signed(c["bot_pnl_usd"]),
+                    "completed": c["portal_completed"],
+                    "missed": c["bot_missed"],
+                } for c in callers]
+                ui.table(
+                    columns=[
+                        {"name": "caller", "label": "Caller", "field": "caller"},
+                        {"name": "portal_pnl", "label": "Portal $", "field": "portal_pnl"},
+                        {"name": "bot_pnl", "label": "Bot $", "field": "bot_pnl"},
+                        {"name": "completed", "label": "Portal completed", "field": "completed"},
+                        {"name": "missed", "label": "Bot missed", "field": "missed"},
+                    ],
+                    rows=_caller_rows, row_key="caller",
+                ).classes("w-full")
+
+        # Per-trade table
+        ui.label("Trade-level reconciliation").classes("text-base font-semibold mt-2")
+        ui.label("Newest first. Negative bot $ = realized loss.").classes("text-xs opacity-60")
+        trade_rows = []
+        for r in reconciled:
+            trade_rows.append({
+                "trade_id": r.trade_id,
+                "coin": r.coin,
+                "side": (r.side or "").upper(),
+                "caller": r.caller or "—",
+                "status": r.bot_status,
+                "portal_pnl_pct": (
+                    f"{r.portal_pnl_pct*100:+.2f}%" if r.portal_pnl_pct is not None else "—"
+                ),
+                "portal_pnl_usd": (
+                    _signed(r.portal_pnl_pct * per_trade_margin)
+                    if r.portal_pnl_pct is not None else "—"
+                ),
+                "bot_pnl_usd": _signed(r.bot_pnl_usd) if r.bot_pnl_usd is not None else "—",
+                "bot_fee_usd": (
+                    f"${r.bot_fee_usd:.2f}" if r.bot_fee_usd is not None else "—"
+                ),
+            })
+        ui.table(
+            columns=[
+                {"name": "trade_id", "label": "ID", "field": "trade_id", "sortable": True},
+                {"name": "coin", "label": "Coin", "field": "coin", "sortable": True},
+                {"name": "side", "label": "Side", "field": "side"},
+                {"name": "caller", "label": "Caller", "field": "caller", "sortable": True},
+                {"name": "status", "label": "Status", "field": "status", "sortable": True},
+                {"name": "portal_pnl_pct", "label": "Portal %", "field": "portal_pnl_pct"},
+                {"name": "portal_pnl_usd", "label": "Portal $", "field": "portal_pnl_usd"},
+                {"name": "bot_pnl_usd", "label": "Bot $", "field": "bot_pnl_usd"},
+                {"name": "bot_fee_usd", "label": "Bot fee", "field": "bot_fee_usd"},
+            ],
+            rows=trade_rows, row_key="trade_id",
+            pagination={"rowsPerPage": 50},
+        ).classes("w-full")
 
 
 def _feed_color(kind: str) -> str:
