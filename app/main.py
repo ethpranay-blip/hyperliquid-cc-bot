@@ -350,6 +350,10 @@ async def handle_new_trade(event: dict) -> None:
             coin=coin, side=side, reason="stale", caller=caller,
             trade_id=int(trade_id), detail="posted before bot start",
         )
+        db.insert_skipped_trade(
+            trade_id=int(trade_id), coin=coin, side=side, caller=caller,
+            reason="stale", detail="posted before bot start",
+        )
         return
 
     # Auto-mode: open immediately if coin not already live
@@ -360,6 +364,11 @@ async def handle_new_trade(event: dict) -> None:
             notifier.notify_skipped(
                 coin=coin, side=side, reason="blocked_coin_live",
                 caller=caller, trade_id=int(trade_id),
+                detail=f"{coin} already has an open position",
+            )
+            db.insert_skipped_trade(
+                trade_id=int(trade_id), coin=coin, side=side, caller=caller,
+                reason="blocked_coin_live",
                 detail=f"{coin} already has an open position",
             )
             return
@@ -794,6 +803,11 @@ async def enter_trade(trade_id: int) -> None:
             caller=caller, trade_id=int(trade_id),
             detail=f"{coin} already has an open position",
         )
+        db.insert_skipped_trade(
+            trade_id=int(trade_id), coin=coin, side=side, caller=caller,
+            reason="blocked_coin_live",
+            detail=f"{coin} already has an open position",
+        )
         return
     if state.hl is None:
         _safe_notify("HL client not ready", "negative")
@@ -838,6 +852,11 @@ async def enter_trade(trade_id: int) -> None:
             caller=caller, trade_id=int(trade_id),
             detail=f"${available:.2f} avail < ${required:.2f} needed",
         )
+        db.insert_skipped_trade(
+            trade_id=int(trade_id), coin=coin, side=side, caller=caller,
+            reason="insufficient_margin",
+            detail=f"${available:.2f} avail < ${required:.2f} needed",
+        )
         state.pending_trades.pop(int(trade_id), None)
         state.fire_refresh()
         return
@@ -864,19 +883,30 @@ async def enter_trade(trade_id: int) -> None:
             f"called {_fmt_price(exc.level)}, drift {exc.drift_pct*100:.2f}%)",
             int(trade_id),
         )
+        _slip_detail = (
+            f"mid {_fmt_price(exc.mid)} vs called {_fmt_price(exc.level)} "
+            f"({exc.drift_pct*100:.2f}% drift > {exc.slip_pct*100:.2f}% cap)"
+        )
         notifier.notify_skipped(
             coin=coin, side=side, reason="entry_slipped", caller=caller,
-            trade_id=int(trade_id),
-            detail=(
-                f"mid {_fmt_price(exc.mid)} vs called {_fmt_price(exc.level)} "
-                f"({exc.drift_pct*100:.2f}% drift > {exc.slip_pct*100:.2f}% cap)"
-            ),
+            trade_id=int(trade_id), detail=_slip_detail,
+        )
+        db.insert_skipped_trade(
+            trade_id=int(trade_id), coin=coin, side=side, caller=caller,
+            reason="entry_slipped", detail=_slip_detail,
         )
         state.pending_trades.pop(int(trade_id), None)
         state.fire_refresh()
         return
     except HyperliquidValidationError as exc:
         _safe_notify(f"Open rejected #{trade_id}: {exc}", "negative")
+        # Distinguish "asset not on HL" (capture-rate cause) from other
+        # rejections so the performance page can show it.
+        if "not found on any dex" in str(exc).lower():
+            db.insert_skipped_trade(
+                trade_id=int(trade_id), coin=coin, side=side, caller=caller,
+                reason="ticker_not_found", detail=str(exc),
+            )
         return
     except HyperliquidError as exc:
         _safe_notify(f"HL error #{trade_id}: {exc}", "negative")
@@ -1957,6 +1987,30 @@ async def performance_page() -> None:
                 with ui.element("div").classes("perf-metric"):
                     ui.label(label).classes("label")
                     ui.html(f'<div class="value">{count}</div>')
+
+        # Skip-reason breakdown (persisted — survives log rotation)
+        try:
+            skip_counts = db.get_skip_reason_counts()
+        except Exception:
+            skip_counts = {}
+        if skip_counts:
+            ui.label("Why signals were skipped (persisted)").classes("text-base font-semibold mt-2")
+            ui.label(
+                "Recorded at skip time, so this survives log rotation. "
+                "ticker_not_found = caller's symbol isn't on HL (or needs an alias)."
+            ).classes("text-xs opacity-60")
+            _skip_labels = {
+                "stale": "🕰️ Stale (pre-startup)",
+                "blocked_coin_live": "🚫 Blocked (coin already live)",
+                "insufficient_margin": "💸 Insufficient margin",
+                "entry_slipped": "🎯 Entry slipped (>cap)",
+                "ticker_not_found": "❓ Ticker not on HL",
+            }
+            with ui.row().classes("gap-3 flex-wrap"):
+                for reason, count in sorted(skip_counts.items(), key=lambda x: -x[1]):
+                    with ui.element("div").classes("perf-metric"):
+                        ui.label(_skip_labels.get(reason, reason)).classes("label")
+                        ui.html(f'<div class="value">{count}</div>')
 
         # Per-caller chart
         ui.label("Performance by caller").classes("text-base font-semibold mt-2")

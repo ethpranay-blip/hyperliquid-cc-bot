@@ -144,6 +144,25 @@ CREATE TABLE IF NOT EXISTS bot_settings (
     at    TEXT NOT NULL
 );
 
+-- Why a portal signal was NOT entered. Persisted (not just logged) so the
+-- /performance page can show capture-rate causes that survive log rotation.
+-- UNIQUE(trade_id, reason) + INSERT OR IGNORE de-dups the repeated skips a
+-- stale/blocked signal generates on every ~3s poll.
+CREATE TABLE IF NOT EXISTS hl_skipped_trades (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id  INTEGER,
+    coin      TEXT,
+    side      TEXT,
+    caller    TEXT,
+    reason    TEXT    NOT NULL,
+    detail    TEXT,
+    at        TEXT    NOT NULL,
+    UNIQUE(trade_id, reason)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skipped_trade_id ON hl_skipped_trades(trade_id);
+CREATE INDEX IF NOT EXISTS idx_skipped_at       ON hl_skipped_trades(at);
+
 CREATE INDEX IF NOT EXISTS idx_opened_trade_id ON hl_opened_trades(trade_id);
 CREATE INDEX IF NOT EXISTS idx_closed_trade_id ON hl_closed_trades(trade_id);
 CREATE INDEX IF NOT EXISTS idx_closed_at       ON hl_closed_trades(at);
@@ -972,6 +991,54 @@ def get_sizing_settings(
             default_risk_usd if default_risk_usd is not None else default_margin_usd,
         ),
     }
+
+
+# ============================================================
+# SECTION: hl_skipped_trades — why a signal wasn't entered
+# ============================================================
+
+def insert_skipped_trade(
+    *,
+    trade_id: Optional[int],
+    coin: Optional[str],
+    reason: str,
+    side: Optional[str] = None,
+    caller: Optional[str] = None,
+    detail: Optional[str] = None,
+    at: Optional[str] = None,
+) -> None:
+    """Record a skipped signal (idempotent per trade_id+reason).
+
+    `reason` is one of: stale / blocked_coin_live / insufficient_margin /
+    entry_slipped / ticker_not_found. Free-form strings accepted for future
+    cases. Repeated skips of the same (trade_id, reason) are ignored.
+    """
+    _execute(
+        """
+        INSERT OR IGNORE INTO hl_skipped_trades
+            (trade_id, coin, side, caller, reason, detail, at)
+        VALUES (?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            None if trade_id is None else int(trade_id),
+            coin, side, caller, reason, detail, at or _utcnow_iso(),
+        ),
+    )
+
+
+def list_skipped_trades(limit: int = 500) -> list[dict]:
+    rows = _execute(
+        "SELECT * FROM hl_skipped_trades ORDER BY id DESC LIMIT ?;",
+        (int(limit),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_skip_reason_counts() -> dict[str, int]:
+    rows = _execute(
+        "SELECT reason, COUNT(*) AS n FROM hl_skipped_trades GROUP BY reason;"
+    ).fetchall()
+    return {r["reason"]: int(r["n"]) for r in rows}
 
 
 # ============================================================
