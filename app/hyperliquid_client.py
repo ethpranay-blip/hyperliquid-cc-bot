@@ -206,6 +206,36 @@ def round_px(px: float, sz_decimals: int) -> float:
 # SECTION: Symbol / k-coin helpers
 # ============================================================
 
+# Caller-ticker → HL base-symbol aliases. FALLBACK ONLY: resolve_asset always
+# tries the exact caller ticker against HL's live universe FIRST, so a token HL
+# lists (now or after a future listing) is copied directly with no code change.
+# The alias is consulted only when the exact name isn't found. Each entry maps
+# a name some caller uses to the equivalent instrument HL actually lists.
+#
+# Safety: an alias is still validated against the live universe (unknown → trade
+# skipped, never guessed), and the 0.5% entry-slippage cap rejects any
+# wrong-scale fill — so a bad/aliased mapping can NEVER enter the wrong trade.
+# Add proxy mappings (an index perp standing in for an ETF a caller named) only
+# after explicit sign-off, since they trade the same underlying under a
+# different product.
+TICKER_ALIASES: dict[str, str] = {
+    "US500": "SP500",   # S&P 500 — HL lists xyz:SP500 (verified in live meta)
+    # "QQQ": "...",     # PENDING: not found on probed dexes; confirm HL listing
+}
+
+
+def aliased_symbol(symbol: str) -> Optional[str]:
+    """Return the HL fallback symbol for a caller ticker, or None.
+
+    Pure + testable. Guards against self-referential map entries.
+    """
+    s = symbol.upper().strip()
+    alias = TICKER_ALIASES.get(s)
+    if alias and alias.upper().strip() != s:
+        return alias.upper().strip()
+    return None
+
+
 def hl_symbol_for(portal_coin: str) -> str:
     """Return HL symbol (with k-prefix for qualifying memecoins)."""
     s = portal_coin.upper().strip()
@@ -646,38 +676,70 @@ class HyperliquidClient:
                 self._asset_index[hl_coin] = info
                 return info
 
-            for dex in self._active_dexs:
-                try:
-                    meta = self._meta_cache.get(dex) or await self._load_meta(dex)
-                    self._meta_cache[dex] = meta
-                except Exception as exc:
-                    log.debug("meta load failed for dex=%r: %s", dex, exc)
-                    continue
-                universe = meta.get("universe") or []
-                # Names can appear either as "SILVER" (default dex) or
-                # "xyz:SILVER" (HIP-3 dex). Match either.
-                dex_prefixed = f"{dex}:{hl_coin}" if dex else hl_coin
-                for idx, asset in enumerate(universe):
-                    name = asset.get("name")
-                    if name == hl_coin or name == dex_prefixed:
-                        info = {
-                            "hl_coin": hl_coin,
-                            "order_name": name,
-                            "dex": dex,
-                            "sz_decimals": int(asset.get("szDecimals", 4)),
-                            "max_leverage": int(asset.get("maxLeverage", 50)),
-                            "asset_id": idx,
-                        }
-                        self._asset_index[hl_coin] = info
-                        log.info(
-                            "resolved %s → order_name=%r dex=%r sz_dec=%d max_lev=%d",
-                            hl_coin, name, dex, info["sz_decimals"], info["max_leverage"],
-                        )
-                        return info
+            # 1) EXACT match first — so any token HL lists (now or in a future
+            #    listing) is copied directly with no code change.
+            info = await self._search_universe(hl_coin)
+            if info is not None:
+                self._asset_index[hl_coin] = info
+                log.info(
+                    "resolved %s → order_name=%r dex=%r sz_dec=%d max_lev=%d",
+                    hl_coin, info["order_name"], info["dex"],
+                    info["sz_decimals"], info["max_leverage"],
+                )
+                return info
+
+            # 2) ALIAS fallback — only for names HL lists under a different
+            #    symbol. The result is validated (it came from the live
+            #    universe), and order_name/dex point at the REAL instrument
+            #    while hl_coin stays the caller's symbol so the rest of the
+            #    system (DB, is_coin_live, price lookups) keys consistently.
+            alias = aliased_symbol(hl_coin) or aliased_symbol(portal_coin)
+            if alias:
+                info = await self._search_universe(alias)
+                if info is not None:
+                    info["hl_coin"] = hl_coin
+                    info["alias_of"] = alias
+                    self._asset_index[hl_coin] = info
+                    log.warning(
+                        "resolved %s via ALIAS → %s (order_name=%r dex=%r "
+                        "sz_dec=%d max_lev=%d)",
+                        hl_coin, alias, info["order_name"], info["dex"],
+                        info["sz_decimals"], info["max_leverage"],
+                    )
+                    return info
 
             raise HyperliquidValidationError(
                 f"asset {portal_coin!r} (hl={hl_coin!r}) not found on any dex"
             )
+
+    async def _search_universe(self, symbol: str) -> Optional[dict]:
+        """Search active dexes for an exact `symbol` match. Returns the asset
+        info dict, or None if not found. Caller must hold _meta_lock.
+
+        Names appear either bare ("SILVER" on the default dex) or dex-prefixed
+        ("xyz:SILVER" on HIP-3) — match either form.
+        """
+        for dex in self._active_dexs:
+            try:
+                meta = self._meta_cache.get(dex) or await self._load_meta(dex)
+                self._meta_cache[dex] = meta
+            except Exception as exc:
+                log.debug("meta load failed for dex=%r: %s", dex, exc)
+                continue
+            universe = meta.get("universe") or []
+            dex_prefixed = f"{dex}:{symbol}" if dex else symbol
+            for idx, asset in enumerate(universe):
+                name = asset.get("name")
+                if name == symbol or name == dex_prefixed:
+                    return {
+                        "hl_coin": symbol,
+                        "order_name": name,
+                        "dex": dex,
+                        "sz_decimals": int(asset.get("szDecimals", 4)),
+                        "max_leverage": int(asset.get("maxLeverage", 50)),
+                        "asset_id": idx,
+                    }
+        return None
 
     async def get_price_for_pricing(self, portal_coin: str) -> Optional[float]:
         """Best-available price for sizing (WS dict → REST fallback).
