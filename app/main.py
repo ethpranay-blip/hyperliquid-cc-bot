@@ -50,6 +50,7 @@ from app.execution import (
 from app.performance import (
     reconcile as _perf_reconcile,
     summarize as _perf_summarize,
+    cumulative_series as _perf_cumulative,
     STATUS_COPIED_CLOSED, STATUS_MISSED, STATUS_COPIED_OPEN,
     STATUS_COPIED_ORPHAN, STATUS_BOT_ONLY,
 )
@@ -1890,6 +1891,9 @@ async def performance_page() -> None:
         summary = _perf_summarize(
             reconciled, per_trade_margin_usd=per_trade_margin,
         )
+        curves = _perf_cumulative(
+            reconciled, per_trade_margin_usd=per_trade_margin,
+        )
     except Exception as exc:
         container.clear()
         with container:
@@ -1954,6 +1958,63 @@ async def performance_page() -> None:
                 _signed_cls(summary["direct_diff_usd"]),
             )
 
+        # Cumulative PnL curves — the headline "are we tracking the callers" visual
+        if curves["portal"] or curves["bot"]:
+            ui.label("Cumulative PnL over time").classes("text-base font-semibold mt-2")
+            ui.label(
+                "Each curve sums its own closed trades in time order. Portal uses "
+                f"${per_trade_margin:.0f} × pnl% at the portal close time; bot uses "
+                "realized PnL at the bot close time. Flat stretches = no closes."
+            ).classes("text-xs opacity-60")
+            try:
+                ui.echart({
+                    "backgroundColor": "transparent",
+                    "tooltip": {
+                        "trigger": "axis",
+                        "axisPointer": {"type": "cross"},
+                    },
+                    "legend": {
+                        "data": ["Portal hypothetical $", "Bot actual $"],
+                        "textStyle": {"color": "#e2e8f0"},
+                        "top": 4,
+                    },
+                    "grid": {"left": 70, "right": 30, "top": 44, "bottom": 48},
+                    "xAxis": {
+                        "type": "time",
+                        "axisLabel": {"color": "#a0aec0"},
+                        "axisLine": {"lineStyle": {"color": "#4a5568"}},
+                        "splitLine": {"show": False},
+                    },
+                    "yAxis": {
+                        "type": "value",
+                        "axisLabel": {"color": "#a0aec0", "formatter": "${value}"},
+                        "splitLine": {"lineStyle": {"color": "#2d3748"}},
+                    },
+                    "series": [
+                        {
+                            "name": "Portal hypothetical $", "type": "line",
+                            "step": "end", "showSymbol": True, "symbolSize": 6,
+                            "lineStyle": {"width": 2.5, "color": "#63b3ed"},
+                            "itemStyle": {"color": "#63b3ed"},
+                            "areaStyle": {"opacity": 0.08, "color": "#63b3ed"},
+                            "data": curves["portal"],
+                        },
+                        {
+                            "name": "Bot actual $", "type": "line",
+                            "step": "end", "showSymbol": True, "symbolSize": 6,
+                            "lineStyle": {"width": 2.5, "color": "#f6ad55"},
+                            "itemStyle": {"color": "#f6ad55"},
+                            "areaStyle": {"opacity": 0.08, "color": "#f6ad55"},
+                            "data": curves["bot"],
+                        },
+                    ],
+                }).classes("w-full").style("height: 360px;")
+            except Exception:
+                log.debug("ui.echart unavailable for cumulative curve", exc_info=True)
+                ui.label(
+                    "Chart unavailable in this NiceGUI version — totals above still apply."
+                ).classes("text-xs opacity-60")
+
         # Wider totals
         ui.label("Wider totals — full window each side").classes("text-base font-semibold mt-2")
         with ui.row().classes("gap-3 flex-wrap"):
@@ -2006,11 +2067,48 @@ async def performance_page() -> None:
                 "entry_slipped": "🎯 Entry slipped (>cap)",
                 "ticker_not_found": "❓ Ticker not on HL",
             }
-            with ui.row().classes("gap-3 flex-wrap"):
-                for reason, count in sorted(skip_counts.items(), key=lambda x: -x[1]):
-                    with ui.element("div").classes("perf-metric"):
-                        ui.label(_skip_labels.get(reason, reason)).classes("label")
-                        ui.html(f'<div class="value">{count}</div>')
+            _skip_colors = {
+                "stale": "#ed8936",
+                "blocked_coin_live": "#ecc94b",
+                "insufficient_margin": "#fc8181",
+                "entry_slipped": "#9f7aea",
+                "ticker_not_found": "#63b3ed",
+            }
+            _sorted_skips = sorted(skip_counts.items(), key=lambda x: -x[1])
+            with ui.row().classes("w-full items-center gap-4 flex-wrap"):
+                try:
+                    ui.echart({
+                        "backgroundColor": "transparent",
+                        "tooltip": {"trigger": "item",
+                                    "formatter": "{b}: {c} ({d}%)"},
+                        "series": [{
+                            "type": "pie",
+                            "radius": ["45%", "75%"],
+                            "avoidLabelOverlap": True,
+                            "itemStyle": {"borderRadius": 6,
+                                          "borderColor": "#1a202c",
+                                          "borderWidth": 2},
+                            "label": {"color": "#e2e8f0",
+                                      "formatter": "{b}\n{c}"},
+                            "data": [
+                                {
+                                    "name": _skip_labels.get(r, r),
+                                    "value": n,
+                                    "itemStyle": {
+                                        "color": _skip_colors.get(r, "#a0aec0"),
+                                    },
+                                }
+                                for r, n in _sorted_skips
+                            ],
+                        }],
+                    }).classes("flex-grow").style("height: 280px; min-width: 380px;")
+                except Exception:
+                    log.debug("ui.echart unavailable for skip donut", exc_info=True)
+                with ui.column().classes("gap-2"):
+                    for reason, count in _sorted_skips:
+                        with ui.element("div").classes("perf-metric"):
+                            ui.label(_skip_labels.get(reason, reason)).classes("label")
+                            ui.html(f'<div class="value">{count}</div>')
 
         # Per-caller chart
         ui.label("Performance by caller").classes("text-base font-semibold mt-2")
@@ -2018,28 +2116,42 @@ async def performance_page() -> None:
         if callers:
             try:
                 ui.echart({
-                    "tooltip": {"trigger": "axis"},
+                    "backgroundColor": "transparent",
+                    "tooltip": {"trigger": "axis",
+                                "axisPointer": {"type": "shadow"}},
                     "legend": {"data": ["Portal hypothetical $", "Bot actual $"],
-                               "textStyle": {"color": "#e2e8f0"}},
-                    "grid": {"left": 60, "right": 30, "top": 50, "bottom": 40},
+                               "textStyle": {"color": "#e2e8f0"}, "top": 4},
+                    "grid": {"left": 70, "right": 30, "top": 44, "bottom": 36},
                     "xAxis": {
                         "type": "category",
                         "data": [c["caller"] for c in callers],
-                        "axisLabel": {"color": "#e2e8f0"},
+                        "axisLabel": {"color": "#e2e8f0", "fontSize": 13},
+                        "axisLine": {"lineStyle": {"color": "#4a5568"}},
                     },
                     "yAxis": {
                         "type": "value",
-                        "axisLabel": {"color": "#e2e8f0", "formatter": "${value}"},
+                        "axisLabel": {"color": "#a0aec0", "formatter": "${value}"},
+                        "splitLine": {"lineStyle": {"color": "#2d3748"}},
                     },
                     "series": [
                         {"name": "Portal hypothetical $", "type": "bar",
-                         "itemStyle": {"color": "#63b3ed"},
+                         "barMaxWidth": 56,
+                         "itemStyle": {"color": "#63b3ed",
+                                       "borderRadius": [6, 6, 0, 0]},
+                         "label": {"show": True, "position": "top",
+                                   "color": "#e2e8f0",
+                                   "formatter": "${c}"},
                          "data": [round(c["portal_pnl_usd"], 2) for c in callers]},
                         {"name": "Bot actual $", "type": "bar",
-                         "itemStyle": {"color": "#f6ad55"},
+                         "barMaxWidth": 56,
+                         "itemStyle": {"color": "#f6ad55",
+                                       "borderRadius": [6, 6, 0, 0]},
+                         "label": {"show": True, "position": "top",
+                                   "color": "#e2e8f0",
+                                   "formatter": "${c}"},
                          "data": [round(c["bot_pnl_usd"], 2) for c in callers]},
                     ],
-                }).classes("w-full").style("height: 320px;")
+                }).classes("w-full").style("height: 340px;")
             except Exception:
                 # ui.echart may not be available in older NiceGUI — fall back to
                 # a simple table so the page still renders.

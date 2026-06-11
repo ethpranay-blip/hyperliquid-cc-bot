@@ -62,6 +62,7 @@ class ReconciledTrade:
     bot_size: Optional[float] = None
     bot_entry_price: Optional[float] = None
     bot_exit_price: Optional[float] = None
+    bot_closed_at: Optional[int] = None      # epoch ms, parsed from row "at"
 
 
 def _int_or_none(v: Any) -> Optional[int]:
@@ -78,6 +79,21 @@ def _float_or_none(v: Any) -> Optional[float]:
         return None
     try:
         return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def _iso_to_ms(v: Any) -> Optional[int]:
+    """Parse a DB ISO-8601 UTC timestamp ("2026-06-01T12:34:56+00:00") to
+    epoch ms. Returns None on anything unparseable."""
+    if not v or not isinstance(v, str):
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(v)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
     except (ValueError, TypeError):
         return None
 
@@ -170,6 +186,7 @@ def reconcile(
             rt.bot_size = _float_or_none(bc.get("size"))
             rt.bot_entry_price = _float_or_none(bc.get("entry_price"))
             rt.bot_exit_price = _float_or_none(bc.get("exit_price"))
+            rt.bot_closed_at = _iso_to_ms(bc.get("closed_at") or bc.get("at"))
         elif tid in bot_live_set:
             rt.bot_status = STATUS_COPIED_OPEN
             if tid in bot_open_by_id:
@@ -201,6 +218,7 @@ def reconcile(
             bot_size=_float_or_none(bc.get("size")),
             bot_entry_price=_float_or_none(bc.get("entry_price")),
             bot_exit_price=_float_or_none(bc.get("exit_price")),
+            bot_closed_at=_iso_to_ms(bc.get("closed_at") or bc.get("at")),
         ))
 
     # --- Step 5: sort newest-first by opened-at (portal) else by bot info ---
@@ -304,3 +322,40 @@ def summarize(
         "by_caller": by_caller_list,
         "per_trade_margin_usd": per_trade_margin_usd,
     }
+
+
+def cumulative_series(
+    reconciled: list[ReconciledTrade],
+    *,
+    per_trade_margin_usd: float,
+) -> dict:
+    """Time-ordered cumulative-PnL curves for charting.
+
+    Returns {"portal": [[ts_ms, cum_usd], ...], "bot": [[ts_ms, cum_usd], ...]}.
+
+    - Portal curve: every completed portal trade (pnl_pct present), at its
+      portal close timestamp, $ = pnl_pct × per_trade_margin.
+    - Bot curve: every bot-closed trade (pnl present), at its bot close
+      timestamp.
+    Points missing a usable timestamp are dropped (a curve needs an x-axis);
+    each curve is independently sorted oldest→newest and cumulatively summed.
+    """
+    portal_pts: list[tuple[int, float]] = []
+    bot_pts: list[tuple[int, float]] = []
+    for r in reconciled:
+        if r.portal_pnl_pct is not None and r.portal_closed_at:
+            portal_pts.append(
+                (int(r.portal_closed_at), r.portal_pnl_pct * per_trade_margin_usd)
+            )
+        if r.bot_pnl_usd is not None and r.bot_closed_at:
+            bot_pts.append((int(r.bot_closed_at), float(r.bot_pnl_usd)))
+
+    def _accumulate(pts: list[tuple[int, float]]) -> list[list[float]]:
+        pts.sort(key=lambda p: p[0])
+        out, total = [], 0.0
+        for ts, delta in pts:
+            total += delta
+            out.append([ts, round(total, 2)])
+        return out
+
+    return {"portal": _accumulate(portal_pts), "bot": _accumulate(bot_pts)}
