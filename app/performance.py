@@ -98,24 +98,20 @@ def _iso_to_ms(v: Any) -> Optional[int]:
         return None
 
 
-def reconcile(
-    portal_events: list[dict],
-    bot_opens: list[dict],
-    bot_closeds: list[dict],
-    bot_live_ids: set[int],
+def aggregate_portal_trades(
+    raw_events: list[dict],
     allowed_callers: set[str],
-) -> list[ReconciledTrade]:
-    """Build the per-trade reconciliation list.
+) -> dict[int, dict]:
+    """Collapse a raw activity feed into {trade_id: portal-trade outcome}.
 
-    Joins by portal trade_id. Callers not in `allowed_callers` are filtered
-    (case-insensitive). Bot trades whose trade_id isn't in the portal window
-    are appended with status=bot_only so the user still sees them.
+    Pure. Each outcome dict has trade_id/coin/caller/side/opened_at/closed_at/
+    pnl_pct/close_price — the exact shape db.upsert_portal_trade accepts and
+    db.list_portal_trades returns, so the dashboard can persist and reload it
+    without translation. Non-whitelisted callers are dropped.
     """
     allowed_lc = {c.lower() for c in allowed_callers}
-
-    # --- Step 1: aggregate portal events by trade_id ---
-    portal_trades: dict[int, dict] = {}
-    for evt in portal_events:
+    out: dict[int, dict] = {}
+    for evt in raw_events:
         if not isinstance(evt, dict):
             continue
         kind = str(evt.get("type") or evt.get("eventType") or "").lower()
@@ -125,7 +121,7 @@ def reconcile(
         caller = (evt.get("caller") or "").strip()
         if caller and caller.lower() not in allowed_lc:
             continue
-        slot = portal_trades.setdefault(tid, {
+        slot = out.setdefault(tid, {
             "trade_id": tid, "coin": None, "caller": None,
             "side": "long", "opened_at": None, "closed_at": None,
             "pnl_pct": None, "close_price": None,
@@ -149,6 +145,55 @@ def reconcile(
             cp = _float_or_none(evt.get("closePrice") or evt.get("exitPrice"))
             if cp is not None:
                 slot["close_price"] = cp
+    return out
+
+
+def reconcile(
+    portal_events: list[dict],
+    bot_opens: list[dict],
+    bot_closeds: list[dict],
+    bot_live_ids: set[int],
+    allowed_callers: set[str],
+    extra_portal_trades: Optional[dict[int, dict]] = None,
+) -> list[ReconciledTrade]:
+    """Build the per-trade reconciliation list.
+
+    Joins by portal trade_id. Callers not in `allowed_callers` are filtered
+    (case-insensitive). Bot trades whose trade_id isn't on the portal side are
+    appended with status=bot_only so the user still sees them.
+
+    `extra_portal_trades` is persisted portal history (db.list_portal_trades)
+    keyed by trade_id. It's merged UNDER the live feed (live wins; persisted
+    only fills gaps) so trades that have scrolled off the rolling feed remain
+    matchable — without this, the comparison decays to "0 matched" over time.
+    """
+    allowed_lc = {c.lower() for c in allowed_callers}
+
+    # --- Step 1: aggregate the live feed, then merge persisted history under it ---
+    portal_trades: dict[int, dict] = aggregate_portal_trades(portal_events, allowed_callers)
+    if extra_portal_trades:
+        _MERGE_KEYS = ("coin", "caller", "side", "opened_at",
+                       "closed_at", "pnl_pct", "close_price")
+        for tid, persisted in extra_portal_trades.items():
+            tid = int(tid)
+            c = (persisted.get("caller") or "").strip()
+            if c and c.lower() not in allowed_lc:
+                continue
+            if tid not in portal_trades:
+                # Fully rolled off the live feed — restore from persistence.
+                portal_trades[tid] = {
+                    "trade_id": tid,
+                    "side": persisted.get("side") or "long",
+                    **{k: persisted.get(k) for k in _MERGE_KEYS if k != "side"},
+                }
+            else:
+                # In the live feed too — fill only genuinely-missing fields.
+                # (Live always sets side="long" default, so side isn't gap-filled;
+                # pnl_pct / close_price / timestamps are what the comparison needs.)
+                live = portal_trades[tid]
+                for k in _MERGE_KEYS:
+                    if live.get(k) is None and persisted.get(k) is not None:
+                        live[k] = persisted.get(k)
 
     # --- Step 2: index bot data by trade_id ---
     bot_open_by_id = {int(r["trade_id"]): r for r in bot_opens if r.get("trade_id") is not None}

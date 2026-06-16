@@ -51,6 +51,7 @@ from app.performance import (
     reconcile as _perf_reconcile,
     summarize as _perf_summarize,
     cumulative_series as _perf_cumulative,
+    aggregate_portal_trades as _perf_aggregate_portal,
     STATUS_COPIED_CLOSED, STATUS_MISSED, STATUS_COPIED_OPEN,
     STATUS_COPIED_ORPHAN, STATUS_BOT_ONLY,
 )
@@ -1893,11 +1894,31 @@ async def performance_page() -> None:
         )
         per_trade_margin = float(sizing.get("margin_usd") or 100.0)
 
+        # PERSIST the current feed's portal outcomes, then reconcile against
+        # ALL persisted history — so matches survive the feed rolling forward
+        # (the root cause of the "0 matched" decay). Read-path only; never
+        # touches order execution. Persist failures are non-fatal.
+        try:
+            live_agg = _perf_aggregate_portal(portal_events, allowed_callers)
+            for _pt in live_agg.values():
+                db.upsert_portal_trade(**_pt)
+        except Exception:
+            log.exception("performance: portal-trade persist failed (non-fatal)")
+        try:
+            persisted_portal = {
+                int(r["trade_id"]): r for r in db.list_portal_trades()
+                if r.get("trade_id") is not None
+            }
+        except Exception:
+            log.exception("performance: load persisted portal trades failed")
+            persisted_portal = {}
+
         reconciled = _perf_reconcile(
             portal_events=portal_events,
             bot_opens=bot_opens, bot_closeds=bot_closeds,
             bot_live_ids=bot_live_ids,
             allowed_callers=allowed_callers,
+            extra_portal_trades=persisted_portal,
         )
         summary = _perf_summarize(
             reconciled, per_trade_margin_usd=per_trade_margin,
@@ -1949,6 +1970,14 @@ async def performance_page() -> None:
 
         # Headline: direct apples-to-apples comparison
         ui.label("Direct comparison — trades present on both sides").classes("text-base font-semibold")
+        if summary["direct_count"] == 0:
+            ui.label(
+                "No trades currently match on both sides. Your bot's closed "
+                "trades and the portal's recent closes don't overlap yet — the "
+                "portal feed is a rolling window, but portal outcomes are now "
+                "persisted, so matches will populate as new trades close on both "
+                "sides. The 'Wider totals' below are the accurate per-side numbers."
+            ).classes("text-sm opacity-70 perf-caveat w-full")
         with ui.row().classes("gap-3 flex-wrap"):
             _metric(
                 "Portal hypothetical",

@@ -163,6 +163,24 @@ CREATE TABLE IF NOT EXISTS hl_skipped_trades (
 CREATE INDEX IF NOT EXISTS idx_skipped_trade_id ON hl_skipped_trades(trade_id);
 CREATE INDEX IF NOT EXISTS idx_skipped_at       ON hl_skipped_trades(at);
 
+-- Persisted portal trade outcomes (pnl%, close price, timestamps) captured
+-- from the rolling activity feed. The feed is a short window — once a trade
+-- scrolls off it, its outcome is gone. Persisting here keeps the
+-- bot-vs-portal performance comparison accurate as the feed rolls forward,
+-- instead of degrading to "0 matched" over time. Write-side is the dashboard
+-- read path only — never touched by order execution.
+CREATE TABLE IF NOT EXISTS portal_trades (
+    trade_id     INTEGER PRIMARY KEY,
+    coin         TEXT,
+    side         TEXT,
+    caller       TEXT,
+    opened_at    INTEGER,   -- epoch ms
+    closed_at    INTEGER,   -- epoch ms, NULL while still open
+    pnl_pct      REAL,      -- decimal (0.15 = +15%), NULL until closed
+    close_price  REAL,
+    last_seen_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_opened_trade_id ON hl_opened_trades(trade_id);
 CREATE INDEX IF NOT EXISTS idx_closed_trade_id ON hl_closed_trades(trade_id);
 CREATE INDEX IF NOT EXISTS idx_closed_at       ON hl_closed_trades(at);
@@ -1039,6 +1057,59 @@ def get_skip_reason_counts() -> dict[str, int]:
         "SELECT reason, COUNT(*) AS n FROM hl_skipped_trades GROUP BY reason;"
     ).fetchall()
     return {r["reason"]: int(r["n"]) for r in rows}
+
+
+# ============================================================
+# SECTION: portal_trades — persisted portal outcomes for the perf comparison
+# ============================================================
+
+def upsert_portal_trade(
+    *,
+    trade_id: int,
+    coin: Optional[str] = None,
+    side: Optional[str] = None,
+    caller: Optional[str] = None,
+    opened_at: Optional[int] = None,
+    closed_at: Optional[int] = None,
+    pnl_pct: Optional[float] = None,
+    close_price: Optional[float] = None,
+) -> None:
+    """Insert/merge a portal trade outcome. COALESCE keeps already-known
+    fields when a later sighting carries less info — e.g. an open-only
+    re-sighting must NOT wipe a previously-recorded close/pnl."""
+    _execute(
+        """
+        INSERT INTO portal_trades
+            (trade_id, coin, side, caller, opened_at, closed_at,
+             pnl_pct, close_price, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(trade_id) DO UPDATE SET
+            coin         = COALESCE(excluded.coin, portal_trades.coin),
+            side         = COALESCE(excluded.side, portal_trades.side),
+            caller       = COALESCE(excluded.caller, portal_trades.caller),
+            opened_at    = COALESCE(portal_trades.opened_at, excluded.opened_at),
+            closed_at    = COALESCE(excluded.closed_at, portal_trades.closed_at),
+            pnl_pct      = COALESCE(excluded.pnl_pct, portal_trades.pnl_pct),
+            close_price  = COALESCE(excluded.close_price, portal_trades.close_price),
+            last_seen_at = excluded.last_seen_at;
+        """,
+        (
+            int(trade_id), coin, side, caller,
+            None if opened_at is None else int(opened_at),
+            None if closed_at is None else int(closed_at),
+            None if pnl_pct is None else float(pnl_pct),
+            None if close_price is None else float(close_price),
+            _utcnow_iso(),
+        ),
+    )
+
+
+def list_portal_trades(limit: int = 5000) -> list[dict]:
+    rows = _execute(
+        "SELECT * FROM portal_trades ORDER BY COALESCE(opened_at, 0) DESC LIMIT ?;",
+        (int(limit),),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ============================================================
