@@ -29,9 +29,6 @@ DEFAULT_ENTRY_SLIP_PCT = 0.005   # 0.5%
 DEFAULT_TP_SLIP_PCT    = 0.010   # 1.0%
 DEFAULT_SL_SLIP_PCT    = 0.005   # 0.5%  (HL's resting SL trigger is the safety net)
 
-# Back-compat alias (kept so older callers still import).
-DEFAULT_MAX_LEVEL_SLIPPAGE_PCT = DEFAULT_ENTRY_SLIP_PCT
-
 
 def _read_env_slip(env_var: str, default: float) -> float:
     """Parse a slip-pct env var. Accepts a decimal (0.005) or a

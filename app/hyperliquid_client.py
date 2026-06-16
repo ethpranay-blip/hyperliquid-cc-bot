@@ -87,7 +87,10 @@ MAX_RETRIES = 3
 BASE_BACKOFF = 1.0
 MAX_BACKOFF = 15.0
 MIN_NOTIONAL_USD = 10.0
-DEFAULT_SLIPPAGE = 0.05  # 5%
+# Legacy aggressive cushion — used ONLY as the open_trade fallback for k-coins
+# and signals with no caller entry price. The PRIMARY entry/TP/SL slippage
+# policy is the strict per-action caps in app/execution.py (0.5% / 1% / 0.5%).
+DEFAULT_SLIPPAGE = 0.05  # 5% (k-coin / no-portal-entry fallback only)
 
 # Transient-error heuristics (substring match on exception/str)
 _TRANSIENT_KEYWORDS = (
