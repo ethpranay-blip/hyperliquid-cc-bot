@@ -351,6 +351,42 @@ class Notifier:
         lines.append(f"• {_utcnow()}")
         self._dispatch("\n".join(lines))
 
+    def notify_sl_failed(
+        self,
+        *,
+        coin: str,
+        side: str,
+        intended_stop: Optional[float],
+        reason: str,
+        trade_id: Optional[int] = None,
+        protected: bool = True,
+        dry_run: bool = False,
+    ) -> None:
+        """An SL move/replace FAILED. With place-before-cancel the position
+        normally remains protected at its PREVIOUS stop (protected=True);
+        protected=False is the loud "no stop in place" case (shouldn't happen
+        under place-before-cancel, but alert hard if a caller ever reports it).
+        """
+        if not self.enabled:
+            return
+        if protected:
+            header = "⚠️ STOP-LOSS MOVE FAILED" + ("  [DRY RUN]" if dry_run else "")
+            tail = "• Position still protected at PREVIOUS stop"
+        else:
+            header = "🚨 POSITION UNPROTECTED — SL FAILED" + ("  [DRY RUN]" if dry_run else "")
+            tail = "• ⚠️ NO stop in place — check HL NOW"
+        lines = [
+            header,
+            f"• {coin}  {_side_arrow(side)}",
+            f"• Intended stop: {_fmt_price(intended_stop)}",
+            f"• Why: {reason}",
+        ]
+        if trade_id is not None:
+            lines.append(f"• Trade: #{trade_id}")
+        lines.append(tail)
+        lines.append(f"• {_utcnow()}")
+        self._dispatch("\n".join(lines))
+
     def notify_heartbeat(
         self,
         *,
@@ -437,6 +473,10 @@ def notify_sl_moved(**kwargs) -> None:
 
 def notify_skipped(**kwargs) -> None:
     _default.notify_skipped(**kwargs)
+
+
+def notify_sl_failed(**kwargs) -> None:
+    _default.notify_sl_failed(**kwargs)
 
 
 def reload_from_env() -> None:

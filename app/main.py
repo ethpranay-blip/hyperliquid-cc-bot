@@ -497,8 +497,14 @@ async def _auto_trail_stop_after_tp(
             reason=reason, trade_id=int(trade_id), dry_run=state.dry_run,
         )
         log.info("AUTO TRAILING: SL updated #%s → %.6f (%s)", trade_id, new_stop, reason)
-    except Exception:
+    except Exception as exc:
         log.exception("AUTO TRAILING: update_stop failed #%s", trade_id)
+        # place-before-cancel → the prior stop is still in force; alert that
+        # the TRAIL didn't apply, but the position remains protected.
+        notifier.notify_sl_failed(
+            coin=coin, side=side, intended_stop=new_stop, reason=str(exc),
+            trade_id=int(trade_id), protected=True, dry_run=state.dry_run,
+        )
 
 
 async def handle_stop_update(event: dict) -> None:
@@ -537,8 +543,13 @@ async def handle_stop_update(event: dict) -> None:
             new_stop=float(new_stop), reason="portal update",
             trade_id=int(trade_id), dry_run=state.dry_run,
         )
-    except Exception:
+    except Exception as exc:
         log.exception("update_stop failed #%s", trade_id)
+        # place-before-cancel → prior stop still protecting; alert the move failed.
+        notifier.notify_sl_failed(
+            coin=coin, side=side, intended_stop=float(new_stop), reason=str(exc),
+            trade_id=int(trade_id), protected=True, dry_run=state.dry_run,
+        )
 
 
 async def handle_tp_hit(event: dict) -> None:
