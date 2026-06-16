@@ -62,6 +62,7 @@ from app.execution import (
     enforce_slip,
     get_entry_slip_pct,
     get_tp_slip_pct,
+    sl_triggers_immediately,
     slippage_capped_limit,
 )
 
@@ -1271,6 +1272,58 @@ class HyperliquidClient:
             return 0
         return len(to_cancel)
 
+    def _cancel_other_sls(self, order_name: str, keep_cloid_raw: str) -> int:
+        """Cancel every resting reduce-only SL trigger for `order_name` EXCEPT
+        the one with cloid `keep_cloid_raw`. Returns count cancelled.
+
+        Used by the place-before-cancel SL update: after the NEW stop is
+        confirmed resting, this removes the prior stop(s). Because this bot
+        keeps one position per coin and only ever rests SL triggers (never
+        resting TP triggers), "all reduce-only triggers for this coin except
+        the new one" == "the superseded stops" — so this also self-heals any
+        orphaned stops left by a past failed cancel.
+        """
+        if self._exchange is None or self._info is None or not self.main_address:
+            return 0
+        keep = (keep_cloid_raw or "").lower()
+        try:
+            orders = self._info.frontend_open_orders(self.main_address)
+        except Exception as exc:
+            log.warning("frontend_open_orders failed (cancel-other-sls): %s", exc)
+            return 0
+
+        to_cancel: list[dict] = []
+        for o in orders or []:
+            if not isinstance(o, dict):
+                continue
+            if o.get("coin") != order_name or not o.get("reduceOnly"):
+                continue
+            otype = str(o.get("orderType") or "").lower()
+            is_trigger = o.get("isTrigger") or "stop" in otype or "trigger" in otype
+            if not is_trigger:
+                continue
+            if (o.get("cloid") or "").lower() == keep:
+                continue  # this is the new stop — keep it
+            to_cancel.append({"coin": order_name, "oid": o["oid"]})
+
+        if not to_cancel:
+            return 0
+        try:
+            resp = self._exchange.bulk_cancel(to_cancel)
+            _check_hl_response(resp) if isinstance(resp, dict) else None
+            log.info("canceled %d superseded SL(s) for %s", len(to_cancel), order_name)
+        except Exception as exc:
+            log.warning("bulk_cancel (cancel-other-sls) failed for %s: %s", order_name, exc)
+            return 0
+        return len(to_cancel)
+
+    def _fresh_sl_cloid(self, trade_id: int) -> Cloid:
+        """A unique SL cloid per update, so a NEW stop can be placed while the
+        OLD one still rests (place-before-cancel) without a cloid collision."""
+        nonce = int(time.time() * 1000) & ((1 << 64) - 1)
+        num = ((int(trade_id) | (1 << 127)) ^ nonce) & ((1 << 128) - 1)
+        return Cloid.from_str(f"0x{num:032x}")
+
     async def update_stop(
         self,
         *,
@@ -1309,17 +1362,34 @@ class HyperliquidClient:
         if size is None or size <= 0:
             raise HyperliquidValidationError(f"no open size for SL update ({order_name})")
 
-        sl_cloid = self._sl_cloids.get(trade_id) or sl_cloid_for(trade_id)
+        # GUARD: refuse a stop that would fire the instant it's placed (wrong
+        # side of the live mid). Raising HERE — before touching any resting
+        # order — leaves the existing stop intact, so the position stays
+        # protected. Covers BOTH the portal stop_update path and the auto-trail
+        # path (the auto-trail caller has its own pre-check too; this is the
+        # backstop that every caller inherits).
+        if sl_triggers_immediately(new_stop=new_stop_px, mid=mid, is_long=is_buy_original):
+            raise HyperliquidValidationError(
+                f"SL {new_stop_px} would trigger immediately vs mid {mid} "
+                f"({'long' if is_buy_original else 'short'}) — refusing; "
+                f"existing stop left in place"
+            )
 
-        # Step 1: cancel existing SL(s) for this trade by cloid match
-        canceled = await asyncio.to_thread(
-            self._cancel_sls_for_trade, order_name, trade_id, dex,
+        # ── PLACE-BEFORE-CANCEL ──
+        # Old design cancelled the resting stop THEN placed the new one — if
+        # the place failed, the position was left with NO stop. Now we place
+        # the NEW stop first (fresh cloid so it doesn't collide with the old
+        # one still resting); only after it's confirmed do we cancel the old.
+        # If the place fails, we raise WITHOUT having cancelled anything — the
+        # prior stop is still protecting the position.
+        new_cloid = self._fresh_sl_cloid(trade_id)
+        new_cloid_raw = (
+            new_cloid.to_raw() if hasattr(new_cloid, "to_raw") else str(new_cloid)
         )
 
-        # Step 2: place a fresh SL trigger with the same cloid and new price.
-        # Note: for triggers, limit_px is a worst-case protective price.
-        # For a long: SL sells below the market, so limit < trigger;
-        # for a short: SL buys above, so limit > trigger.
+        # For triggers, limit_px is a worst-case protective price.
+        # Long: SL sells below the market (limit < trigger);
+        # Short: SL buys above (limit > trigger).
         protective_mul = 0.9 if is_buy_original else 1.1
         sl_limit_px = round_px(new_stop_px * protective_mul, sz_dec)
 
@@ -1338,7 +1408,7 @@ class HyperliquidClient:
                         "tpsl": "sl",
                     }},
                     reduce_only=True,
-                    cloid=sl_cloid,
+                    cloid=new_cloid,
                 )
             except TypeError:
                 # Older SDK — fall back to bulk_orders([...], grouping="na")
@@ -1354,13 +1424,31 @@ class HyperliquidClient:
                             "tpsl": "sl",
                         }},
                         "reduce_only": True,
-                        "cloid": sl_cloid,
+                        "cloid": new_cloid,
                     }],
                     grouping="na",
                 )
 
-        resp = await self._with_retry(_place, desc=f"replace SL #{trade_id}")
-        self._sl_cloids[trade_id] = sl_cloid
+        # Place the new stop. If this raises, the OLD stop is untouched →
+        # position remains protected. Caller alerts the user.
+        resp = await self._with_retry(_place, desc=f"place new SL #{trade_id}")
+
+        # New stop confirmed resting → it's now safe to remove the old one(s).
+        # Best-effort: a cancel failure leaves a harmless extra reduce-only
+        # stop (the next update self-heals it via _cancel_other_sls).
+        self._sl_cloids[trade_id] = new_cloid
+        try:
+            canceled = await asyncio.to_thread(
+                self._cancel_other_sls, order_name, new_cloid_raw,
+            )
+        except Exception:
+            log.warning(
+                "SL #%s: new stop placed but failed to cancel old one(s) — "
+                "position is OVER-protected (extra reduce-only stop), harmless; "
+                "next update will clean it up", trade_id,
+            )
+            canceled = 0
+
         return {
             "canceled_count": canceled,
             "new_stop_px": new_stop_px,

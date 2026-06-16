@@ -74,6 +74,27 @@ def get_default_slip_pct() -> float:
     return get_entry_slip_pct()
 
 
+def sl_triggers_immediately(
+    *, new_stop: Optional[float], mid: Optional[float], is_long: bool,
+) -> bool:
+    """True if placing a stop at `new_stop` would fire instantly vs `mid`.
+
+    A long's SL is a sell that triggers when price falls TO/below it — so a
+    stop set at or ABOVE the current mid triggers immediately. A short's SL
+    is a buy that triggers when price rises TO/above it — so a stop at or
+    BELOW the current mid triggers immediately. Either case = an unintended
+    instant market close.
+
+    Returns False when inputs are unknown (can't judge → let other guards
+    decide; don't block a legitimate move on missing data).
+    """
+    if new_stop is None or mid is None or mid <= 0:
+        return False
+    if is_long:
+        return new_stop >= mid
+    return new_stop <= mid
+
+
 class LevelSlippageExceeded(Exception):
     """Current price is too far from the caller's level to execute within cap."""
 

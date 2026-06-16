@@ -57,15 +57,35 @@ def compute_position_size(
         distance = abs(mid - sl_px)
         raw_size = risk_usd / distance
         margin_needed = (raw_size * mid) / leverage
-        basis = (
-            f"fixed_risk risk=${risk_usd:g} dist={distance:g} "
-            f"margin≈${margin_needed:.2f}"
-        )
-        # Cap so required margin never exceeds what's available.
-        if available_margin is not None and 0 < available_margin < margin_needed:
+
+        if available_margin is None:
+            # SAFETY: we couldn't verify available margin (API blip / dry-run).
+            # A tight SL makes risk-based size explode (small distance →
+            # huge size), and with no margin ceiling that could open a
+            # wildly oversized position — especially dangerous on cross
+            # margin where the whole account backs it. When funds are
+            # unknown, fall back to fixed-margin sizing for THIS trade:
+            # bounded, predictable, and re-risk-adjusts on the next signal
+            # once the margin query recovers.
+            raw_size = (margin_usd * leverage) / mid
+            basis = (
+                f"fixed_risk→fixed_margin (avail margin unknown — bounded "
+                f"to ${margin_usd:g} margin) "
+                f"[would-be risk margin≈${margin_needed:.2f}]"
+            )
+        elif 0 < available_margin < margin_needed:
+            # Cap so required margin never exceeds what's available.
             capped_notional = available_margin * leverage
             raw_size = capped_notional / mid
-            basis += f" (capped to avail ${available_margin:.2f})"
+            basis = (
+                f"fixed_risk risk=${risk_usd:g} dist={distance:g} "
+                f"margin≈${margin_needed:.2f} (capped to avail ${available_margin:.2f})"
+            )
+        else:
+            basis = (
+                f"fixed_risk risk=${risk_usd:g} dist={distance:g} "
+                f"margin≈${margin_needed:.2f}"
+            )
         size = round(raw_size, int(sz_decimals))
     else:
         if mode == FIXED_RISK:
