@@ -412,24 +412,6 @@ def insert_opened_trade(
     return int(cur.lastrowid)
 
 
-def update_opened_fill_price(trade_id: int, my_fill_price: float) -> None:
-    """Backfill my_fill_price on the most recent opened row for a trade.
-
-    Used when the fill-reconciliation call happens AFTER insert (e.g. when
-    fills take a moment to settle on HL).
-    """
-    _execute(
-        """
-        UPDATE hl_opened_trades
-        SET my_fill_price = ?
-        WHERE id = (
-            SELECT MAX(id) FROM hl_opened_trades WHERE trade_id = ?
-        );
-        """,
-        (float(my_fill_price), int(trade_id)),
-    )
-
-
 def get_opened_trade(trade_id: int) -> Optional[dict]:
     """Return the most recent opened-trade row for a trade_id."""
     row = _execute(
