@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, AsyncIterator, Iterable, Optional
 from urllib.parse import urlparse
@@ -43,7 +44,10 @@ log = logging.getLogger(__name__)
 # ============================================================
 
 DEFAULT_BASE_URL = "https://portal.corgicalls.com"
-DEFAULT_POLL_INTERVAL = 3.0
+# 1.5s (was 3.0): signal→execution latency is headroom inside the strict
+# entry-slippage cap — every second saved is fewer entry_slipped skips on
+# fast movers. Override with PORTAL_POLL_INTERVAL.
+DEFAULT_POLL_INTERVAL = 1.5
 DEFAULT_CALLERS = "voberoi,pranayyyy,corgil_"
 
 
@@ -67,6 +71,33 @@ class PortalAuthError(PortalError):
 # ============================================================
 # SECTION: Helpers
 # ============================================================
+
+# Callers post range entries like "77900-77600" or "$658-650". Take the FIRST
+# number — the near edge, i.e. the price the caller expects to fill first.
+_ENTRY_RANGE_RE = re.compile(
+    r"^\s*\$?(\d[\d,]*\.?\d*)\s*[-–—]\s*\$?(\d[\d,]*\.?\d*)\s*$"
+)
+
+
+def _entry_num(v: Any) -> Optional[float]:
+    """Like _num, but also understands range strings ("77900-77600" → 77900).
+
+    Used ONLY for entry-price fields — a generic number parser must not treat
+    "A-B" as a number, but an entry posted as a range means "I'm bidding the
+    zone from A to B", and A (the near edge) is the actionable level.
+    """
+    n = _num(v)
+    if n is not None:
+        return n
+    if isinstance(v, str):
+        m = _ENTRY_RANGE_RE.match(v.replace(",", ""))
+        if m:
+            try:
+                return float(m.group(1))
+            except (ValueError, TypeError):
+                return None
+    return None
+
 
 def _num(v: Any) -> Optional[float]:
     if v is None or v == "":
@@ -501,7 +532,8 @@ class PortalClient:
             )
         ):
             # entryRaw is the real field name in the Corgi feed (string).
-            entry_price = _num(
+            # _entry_num also handles range entries ("77900-77600" → 77900).
+            entry_price = _entry_num(
                 raw.get("entryPrice")
                 or raw.get("entryRaw")
                 or trade.get("entryPrice")

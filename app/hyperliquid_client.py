@@ -1460,6 +1460,212 @@ class HyperliquidClient:
         }
 
     # ------------------------------------------------------------------
+    # Resting entries — GTC bracket AT the caller's level (no chasing)
+    # ------------------------------------------------------------------
+    # When price has already drifted past the entry-slippage cap, an IOC
+    # would either fill badly or not at all. Instead we park a GTC limit at
+    # the caller's exact entry with the SL trigger attached (normalTpsl —
+    # the SL activates only when/if the entry fills). HL does the waiting;
+    # we only ever fill at the caller's level or better. Fill detection is
+    # the existing reconcile/adoption path (userEvents → adopt within ~2s).
+    # ------------------------------------------------------------------
+
+    async def place_resting_entry(
+        self,
+        *,
+        trade_id: int,
+        portal_coin: str,
+        side: str,
+        entry_px: float,
+        sl_px: float,
+        leverage: Optional[float] = None,
+        sizing_mode: str = "fixed_margin",
+        margin_usd: Optional[float] = None,
+        risk_usd: Optional[float] = None,
+        available_margin: Optional[float] = None,
+    ) -> dict:
+        """Place a GTC limit at the caller's entry + attached SL trigger.
+
+        Raises HyperliquidValidationError when the setup can't be resting-
+        entered safely (k-coin price-space mismatch, missing/invalid levels,
+        SL on the wrong side of entry) — caller falls back to a normal skip.
+        """
+        side_l = side.lower()
+        if side_l not in ("long", "short", "buy", "sell"):
+            raise HyperliquidValidationError(f"invalid side: {side!r}")
+        is_buy = side_l in ("long", "buy")
+
+        if is_k_coin(portal_coin):
+            raise HyperliquidValidationError(
+                "resting entries unsupported for k-coins (portal/HL price-space mismatch)"
+            )
+        if entry_px is None or entry_px <= 0:
+            raise HyperliquidValidationError("resting entry requires the caller's entry price")
+        if sl_px is None or sl_px <= 0:
+            raise HyperliquidValidationError(
+                "resting entry requires the caller's SL (won't park an unprotected bracket)"
+            )
+        # SL must sit on the protective side of the entry, else the trigger
+        # would fire the moment the entry filled.
+        if is_buy and sl_px >= entry_px:
+            raise HyperliquidValidationError(
+                f"long resting entry: SL {sl_px} must be below entry {entry_px}"
+            )
+        if (not is_buy) and sl_px <= entry_px:
+            raise HyperliquidValidationError(
+                f"short resting entry: SL {sl_px} must be above entry {entry_px}"
+            )
+
+        asset = await self.resolve_asset(portal_coin)
+        order_name = asset["order_name"]
+        sz_dec = asset["sz_decimals"]
+        max_lev = asset["max_leverage"]
+        dex = asset["dex"]
+        lev = self._capped_leverage(
+            float(leverage if leverage is not None else self.default_leverage),
+            max_lev,
+        )
+
+        entry_r = round_px(float(entry_px), sz_dec)
+        sl_r = round_px(float(sl_px), sz_dec)
+
+        # Size at the caller's entry — that IS the fill price if this executes.
+        try:
+            size, size_basis = compute_position_size(
+                mode=sizing_mode,
+                mid=entry_r, leverage=lev, sz_decimals=sz_dec, sl_px=sl_r,
+                margin_usd=(margin_usd if margin_usd is not None else self.margin_usd),
+                risk_usd=(risk_usd if risk_usd is not None else self.margin_usd),
+                available_margin=available_margin,
+                min_notional=MIN_NOTIONAL_USD,
+            )
+        except ValueError as exc:
+            raise HyperliquidValidationError(str(exc))
+
+        log.info(
+            "RESTING %s #%s %s GTC entry=%s sl=%s sz=%s lev=%sx [%s] dry_run=%s",
+            order_name, trade_id, side_l, entry_r, sl_r, size, lev,
+            size_basis, self.dry_run,
+        )
+
+        entry_cloid = cloid_for(trade_id)
+        sl_cloid = sl_cloid_for(trade_id)
+
+        if self.dry_run:
+            self._sl_cloids[trade_id] = sl_cloid
+            return {
+                "size": size, "entry_px": entry_r, "sl_px": sl_r,
+                "order_name": order_name, "basis": size_basis,
+                "raw": {"mock": True, "status": "ok"},
+            }
+        if self._exchange is None:
+            raise HyperliquidError("SDK not initialized (missing credentials)")
+
+        await self._set_leverage(
+            order_name, int(lev), cross=self.use_cross_margin, dex=dex,
+        )
+
+        orders = [
+            {
+                "coin": order_name, "is_buy": is_buy, "sz": size,
+                "limit_px": entry_r,
+                "order_type": {"limit": {"tif": "Gtc"}},
+                "reduce_only": False, "cloid": entry_cloid,
+            },
+            {
+                "coin": order_name, "is_buy": not is_buy, "sz": size,
+                "limit_px": sl_r,
+                "order_type": {"trigger": {
+                    "triggerPx": sl_r, "isMarket": True, "tpsl": "sl",
+                }},
+                "reduce_only": True, "cloid": sl_cloid,
+            },
+        ]
+        exchange = self._exchange
+
+        def _submit():
+            try:
+                return exchange.bulk_orders(orders, grouping="normalTpsl")
+            except TypeError:
+                return exchange.bulk_orders(orders)
+
+        resp = await self._with_retry(_submit, desc=f"resting bracket #{trade_id}")
+        self._sl_cloids[trade_id] = sl_cloid
+        return {
+            "size": size, "entry_px": entry_r, "sl_px": sl_r,
+            "order_name": order_name, "basis": size_basis,
+            "raw": resp if isinstance(resp, dict) else {"raw": resp},
+        }
+
+    async def cancel_resting_entry(self, *, trade_id: int, portal_coin: str) -> bool:
+        """Cancel an unfilled resting bracket (entry limit + SL trigger).
+
+        Best-effort: tries cancel-by-cloid first, then a frontend_open_orders
+        scan matching either cloid. Returns True if anything was cancelled.
+        Cancelling an already-gone order is harmless (it filled or expired).
+        """
+        if self.dry_run:
+            return True
+        if self._exchange is None:
+            return False
+        asset = await self.resolve_asset(portal_coin)
+        order_name = asset["order_name"]
+
+        entry_cloid = cloid_for(trade_id)
+        sl_cloid = self._sl_cloids.get(trade_id) or sl_cloid_for(trade_id)
+        exchange = self._exchange
+
+        def _cancel_by_cloid() -> bool:
+            ok = False
+            for cl in (entry_cloid, sl_cloid):
+                try:
+                    exchange.cancel_by_cloid(order_name, cl)
+                    ok = True
+                except Exception:
+                    pass
+            return ok
+
+        ok = await asyncio.to_thread(_cancel_by_cloid)
+        if ok:
+            log.info("resting bracket #%s cancelled (by cloid)", trade_id)
+            return True
+
+        # Fallback: scan open orders for either cloid and bulk-cancel by oid.
+        def _scan_cancel() -> bool:
+            if self._info is None or not self.main_address:
+                return False
+            wanted = set()
+            for cl in (entry_cloid, sl_cloid):
+                wanted.add(
+                    cl.to_raw().lower() if hasattr(cl, "to_raw") else str(cl).lower()
+                )
+            try:
+                orders = self._info.frontend_open_orders(self.main_address)
+            except Exception as exc:
+                log.warning("cancel_resting_entry scan failed #%s: %s", trade_id, exc)
+                return False
+            to_cancel = [
+                {"coin": order_name, "oid": o["oid"]}
+                for o in (orders or [])
+                if isinstance(o, dict)
+                and o.get("coin") == order_name
+                and (o.get("cloid") or "").lower() in wanted
+            ]
+            if not to_cancel:
+                return False
+            try:
+                resp = exchange.bulk_cancel(to_cancel)
+                _check_hl_response(resp) if isinstance(resp, dict) else None
+                return True
+            except Exception as exc:
+                log.warning("cancel_resting_entry bulk_cancel #%s: %s", trade_id, exc)
+                return False
+
+        ok = await asyncio.to_thread(_scan_cancel)
+        log.info("resting bracket #%s cancel via scan: %s", trade_id, ok)
+        return ok
+
+    # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
 

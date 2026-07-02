@@ -62,7 +62,7 @@ Hyperliquid (mainnet or testnet)
 app/db.py  (SQLite WAL, thread-local connections)
   Tables: hl_live_trades, hl_opened_trades, hl_closed_trades, hl_sl_updates,
           hl_tp_updates, portal_events, portal_cookies, hl_pending_trades,
-          bot_settings, hl_skipped_trades, portal_trades
+          bot_settings, hl_skipped_trades, portal_trades, hl_resting_entries
 
 app/notifier.py  (fire-and-forget Discord/Telegram webhook)
   notify_opened / notify_closed / notify_sl_triggered / notify_tp_hit /
@@ -125,6 +125,7 @@ pnl, dry_run, raw).
 | `hl_pending_trades` | Trades the bot couldn't open immediately; FIFO retry queue |
 | `bot_settings` | Live dashboard-editable key/value (sizing_mode, margin_usd, risk_usd) |
 | `hl_skipped_trades` | Why a signal wasn't entered (stale / blocked_coin_live / insufficient_margin / entry_slipped / ticker_not_found); `UNIQUE(trade_id, reason)` |
+| `hl_resting_entries` | Unfilled GTC brackets parked at the caller's entry (fill→graduate via adoption; TTL/close→cancel) |
 | `portal_trades` | Persisted portal outcomes (pnl_pct, close_price, timestamps) so the performance comparison survives the rolling feed |
 
 Notable: `pre-seeded` close_type marks historical trade_ids as already-closed so
@@ -146,7 +147,7 @@ filter them out. `_apply_migrations` adds `my_fill_price` to old DBs.
 | `PORTAL_USER` / `PORTAL_EMAIL` | — | Portal login email |
 | `PORTAL_PASSWORD` | — | Portal login password |
 | `PORTAL_BASE_URL` | `https://portal.corgicalls.com` | Override portal host |
-| `PORTAL_POLL_INTERVAL` | `3.0` | Seconds between activity-feed polls |
+| `PORTAL_POLL_INTERVAL` | `1.5` | Seconds between activity-feed polls |
 | `ALLOWED_CALLERS` | `voberoi,pranayyyy,corgil_` | Comma-separated whitelist |
 | `HL_WALLET_ADDRESS` | — | Main wallet address (positions/fills queried for this) |
 | `HL_PRIVATE_KEY` | — | **API sub-wallet** signing key (never main-wallet key) |
@@ -167,6 +168,9 @@ filter them out. `_apply_migrations` adds `my_fill_price` to old DBs.
 | `HL_CHANGE_DEBOUNCE_SECONDS` | `2.0` | Debounce for userEvents-driven reconcile |
 | `HEARTBEAT_INTERVAL_SECONDS` | `600` | Webhook "still alive" cadence |
 | `NOTIFY_WEBHOOK_URL` | — | Discord/Telegram webhook URL (auto-detected; Telegram needs `?chat_id=`) |
+| `RESTING_ENTRY_TTL_MINUTES` | `60` | How long a resting GTC entry waits at the caller's level before being cancelled |
+| `DASHBOARD_PASSWORD` | — | Password-gates `/` and `/performance`; unset = public + red banner |
+| `DASHBOARD_STORAGE_SECRET` | random per boot | Signs the login session cookie (set to persist sessions across deploys) |
 | `LOG_LEVEL` | `INFO` | Root logger level |
 | `PORT` / `HOST` | `8080` / `0.0.0.0` | NiceGUI bind |
 | `CORGI_DB_PATH` | `data/corgi.db` | SQLite path (set to `/data/corgi.db` on Railway for the volume) |
@@ -200,4 +204,6 @@ The `/performance` page itself persists portal outcomes (read path) on each load
 - **`round_px`** mandatory on every price sent to HL.
 - **Atomic bracket**: `open_trade` sends entry IOC + SL trigger in one `bulk_orders` (`grouping="normalTpsl"`, or `"na"` with no SL).
 - **HIP-3 namespace**: HL uses `dex:COIN`; DB stores bare portal coin. `_bare()` / `hl_symbol_for()` translate.
+- **Resting entries**: when the live mid is past the entry cap, the bot parks a GTC limit bracket AT the caller's entry (SL attached via `normalTpsl` — activates only on fill) instead of skipping. Fill → position appears → adoption re-tracks it; caller-close or TTL expiry (`RESTING_ENTRY_TTL_MINUTES`) → bracket cancelled + skip recorded. Caller SL-moves re-place the bracket. Requires a caller SL; k-coins excluded. Range entries ("77900-77600") parse to the near edge.
+- **Dashboard auth**: `/` and `/performance` are login-gated when `DASHBOARD_PASSWORD` is set (unset → public with a red warning banner).
 - **Performance comparison accuracy**: the activity feed is a rolling window, so portal outcomes are persisted to `portal_trades` and matched against history — the bot-vs-portal comparison stays accurate instead of decaying to "0 matched" as old trades scroll off.

@@ -334,6 +334,8 @@ class Notifier:
             "entry_slipped": "🎯",
             "tp_slipped": "🎯",
             "close_slipped": "🎯",
+            "resting_expired": "⌛",
+            "resting_cancelled": "🕒",
         }.get(reason, "⚠️")
         header = f"{icon} TRADE SKIPPED"
         lines = [header]
@@ -346,6 +348,34 @@ class Notifier:
             lines.append(f"• Detail: {detail}")
         if caller:
             lines.append(f"• Caller: {caller}")
+        if trade_id is not None:
+            lines.append(f"• Trade: #{trade_id}")
+        lines.append(f"• {_utcnow()}")
+        self._dispatch("\n".join(lines))
+
+    def notify_resting(
+        self,
+        *,
+        coin: str,
+        side: str,
+        entry: Optional[float],
+        sl: Optional[float],
+        ttl_minutes: float,
+        trade_id: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> None:
+        """A GTC limit bracket was parked at the caller's entry because price
+        had already moved past the slippage cap — fills only at their level."""
+        if not self.enabled:
+            return
+        header = "🕒 RESTING ENTRY PLACED" + ("  [DRY RUN]" if dry_run else "")
+        lines = [
+            header,
+            f"• {coin}  {_side_arrow(side)}",
+            f"• Waiting at: {_fmt_price(entry)} (caller's entry)",
+            f"• SL attached: {_fmt_price(sl)}",
+            f"• Expires in: {ttl_minutes:g} min if unfilled",
+        ]
         if trade_id is not None:
             lines.append(f"• Trade: #{trade_id}")
         lines.append(f"• {_utcnow()}")
@@ -477,6 +507,10 @@ def notify_skipped(**kwargs) -> None:
 
 def notify_sl_failed(**kwargs) -> None:
     _default.notify_sl_failed(**kwargs)
+
+
+def notify_resting(**kwargs) -> None:
+    _default.notify_resting(**kwargs)
 
 
 def reload_from_env() -> None:
