@@ -58,6 +58,7 @@ from app.performance import (
 from app.portal import PortalClient, PortalAuthError
 from app.trailing import compute_trailed_stop
 from app.adoption import build_open_trade_index
+from app.auth import auth_enabled, password_ok
 
 
 # ============================================================
@@ -1613,8 +1614,55 @@ async def on_shutdown() -> None:
 # SECTION: UI
 # ============================================================
 
+# ============================================================
+# SECTION: Dashboard auth gate
+# ============================================================
+
+def _dash_authed() -> bool:
+    """True if this browser session may see the dashboard.
+
+    Auth disabled (no DASHBOARD_PASSWORD) → always True, with the public-
+    dashboard warning shown instead. Session flag lives in app.storage.user
+    (cookie signed with the storage secret)."""
+    if not auth_enabled():
+        return True
+    try:
+        return bool(app.storage.user.get("dash_authed", False))
+    except Exception:
+        return False
+
+
+@ui.page("/login")
+def login_page() -> None:
+    if _dash_authed():
+        ui.navigate.to("/")
+        return
+
+    def _try(_=None) -> None:
+        if password_ok(pw.value):
+            app.storage.user["dash_authed"] = True
+            ui.navigate.to("/")
+        else:
+            log.warning("dashboard: failed login attempt")
+            ui.notify("Wrong password", type="negative")
+
+    with ui.column().classes("absolute-center items-center gap-4"):
+        ui.label("🔒 Corgi Copy Trading Bot").classes("text-xl font-bold")
+        ui.label("This dashboard controls live trades.").classes(
+            "text-sm opacity-60"
+        )
+        pw = ui.input(
+            "Dashboard password", password=True, password_toggle_button=True,
+        ).classes("w-72")
+        pw.on("keydown.enter", _try)
+        ui.button("Log in", on_click=_try).props("color=primary")
+
+
 @ui.page("/")
 def index() -> None:
+    if not _dash_authed():
+        ui.navigate.to("/login")
+        return
     ui.add_head_html(
         "<style>"
         ".trade-card { border-radius: 10px; padding: 14px; "
@@ -1647,6 +1695,15 @@ def index() -> None:
             ).props("flat color=primary")
             if state.dry_run:
                 ui.label("DRY RUN").classes("dry-banner")
+            if auth_enabled():
+                def _logout() -> None:
+                    app.storage.user["dash_authed"] = False
+                    ui.navigate.to("/login")
+                ui.button("Logout", on_click=_logout).props("flat")
+            else:
+                ui.label("⚠ NO PASSWORD — dashboard is PUBLIC").classes(
+                    "dry-banner"
+                ).style("background:#742a2a;color:#fff5f5;")
 
     # ---- sizing controls (live, persisted to bot_settings; read at trade time) ----
     with ui.expansion("⚙ Position Sizing", icon="tune").classes("w-full"):
@@ -1842,6 +1899,9 @@ def index() -> None:
 
 @ui.page("/performance")
 async def performance_page() -> None:
+    if not _dash_authed():
+        ui.navigate.to("/login")
+        return
     ui.add_head_html(
         "<style>"
         ".perf-metric { background: #1a202c; color: #e2e8f0; padding: 14px 18px; "
@@ -2408,6 +2468,13 @@ def _tick_card_prices() -> None:
 # ============================================================
 
 if __name__ in {"__main__", "__mp_main__"}:
+    import secrets as _secrets
+    if not auth_enabled():
+        log.warning(
+            "⚠ DASHBOARD_PASSWORD is not set — the dashboard (Auto Mode, "
+            "Cancel, sizing) is PUBLICLY accessible. Set DASHBOARD_PASSWORD "
+            "in the environment to require login."
+        )
     ui.run(
         title="Corgi Copy Trading Bot",
         port=int(os.environ.get("PORT", 8080)),
@@ -2415,4 +2482,11 @@ if __name__ in {"__main__", "__mp_main__"}:
         reload=False,
         show=False,
         dark=True,
+        # Signs the app.storage.user session cookie. Without the env var a
+        # random per-boot secret is used → sessions reset on every redeploy
+        # (harmless: you just log in again). Set it to persist sessions.
+        storage_secret=(
+            os.environ.get("DASHBOARD_STORAGE_SECRET")
+            or _secrets.token_hex(32)
+        ),
     )
