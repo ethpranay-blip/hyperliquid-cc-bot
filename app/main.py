@@ -33,7 +33,7 @@ import os
 import sys
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from nicegui import app, ui
@@ -42,7 +42,7 @@ from app import db
 from app import notifier
 from app.hyperliquid_client import (
     HyperliquidClient, HyperliquidError, HyperliquidValidationError,
-    hl_symbol_for, MIN_NOTIONAL_USD,
+    hl_symbol_for, is_k_coin, MIN_NOTIONAL_USD,
 )
 from app.execution import (
     LevelSlippageExceeded, get_sl_slip_pct, get_tp_slip_pct,
@@ -153,6 +153,10 @@ state = AppState()
 # and still count as "fresh". 5 minutes gives room for poll-loop latency and
 # clock skew between the portal and this host.
 STALE_SLACK_MS = 5 * 60 * 1000
+
+# How long a resting GTC entry (parked at the caller's level after the live
+# mid drifted past the slippage cap) waits for a fill before being cancelled.
+RESTING_ENTRY_TTL_MIN = float(os.environ.get("RESTING_ENTRY_TTL_MINUTES", 60))
 
 
 
@@ -304,6 +308,9 @@ async def handle_new_trade(event: dict) -> None:
     if db.get_closed_trade(int(trade_id)) is not None:
         log.info("new_trade #%s already closed in DB — skipping replay", trade_id)
         return
+    if db.get_resting_entry(int(trade_id)) is not None:
+        log.info("new_trade #%s already has a resting entry — skipping", trade_id)
+        return
     if int(trade_id) in state.pending_trades:
         return
 
@@ -359,20 +366,20 @@ async def handle_new_trade(event: dict) -> None:
         )
         return
 
-    # Auto-mode: open immediately if coin not already live
+    # Auto-mode: open immediately if coin not already live (or resting)
     if state.auto_mode:
-        if db.is_coin_live(coin):
-            log.info("auto-mode: %s already live → BLOCKED for #%s", coin, trade_id)
-            _push_activity("blocked", f"BLOCKED {coin} (already live) #{trade_id}", trade_id)
+        if db.is_coin_live(coin) or db.is_coin_resting(coin):
+            log.info("auto-mode: %s already live/resting → BLOCKED for #%s", coin, trade_id)
+            _push_activity("blocked", f"BLOCKED {coin} (already live/resting) #{trade_id}", trade_id)
             notifier.notify_skipped(
                 coin=coin, side=side, reason="blocked_coin_live",
                 caller=caller, trade_id=int(trade_id),
-                detail=f"{coin} already has an open position",
+                detail=f"{coin} already has an open position or resting entry",
             )
             db.insert_skipped_trade(
                 trade_id=int(trade_id), coin=coin, side=side, caller=caller,
                 reason="blocked_coin_live",
-                detail=f"{coin} already has an open position",
+                detail=f"{coin} already has an open position or resting entry",
             )
             return
         log.info("auto-mode: entering #%s", trade_id)
@@ -514,6 +521,52 @@ async def handle_stop_update(event: dict) -> None:
     new_stop = event.get("new_stop")
     if trade_id is None or new_stop is None:
         return
+
+    # Caller moved their SL while our bracket is still resting (unfilled):
+    # cancel and re-place the bracket with the updated SL. Funds-safe even if
+    # the re-place fails — an unfilled entry means no position to protect;
+    # worst case we just miss the trade and record the skip.
+    resting = db.get_resting_entry(int(trade_id))
+    if resting is not None and not db.get_live_trade(int(trade_id)):
+        if state.hl is None:
+            return
+        try:
+            await state.hl.cancel_resting_entry(
+                trade_id=int(trade_id), portal_coin=resting["coin"],
+            )
+        except Exception:
+            log.exception("resting SL-update: cancel failed #%s", trade_id)
+        db.remove_resting_entry(int(trade_id))
+        sizing = db.get_sizing_settings(default_margin_usd=state.hl.margin_usd)
+        available = await state.hl.get_available_margin()
+        placed = await _place_resting_entry_for(
+            trade_id=int(trade_id), coin=resting["coin"],
+            side=resting["side"], caller=resting.get("caller"),
+            entry=resting["entry_px"], stop=float(new_stop),
+            leverage=None,
+            mode=sizing["sizing_mode"], margin_usd=sizing["margin_usd"],
+            risk_usd=sizing["risk_usd"], available=available,
+        )
+        if placed:
+            log.info(
+                "resting bracket #%s re-placed with caller's new SL %s",
+                trade_id, new_stop,
+            )
+        else:
+            notifier.notify_skipped(
+                coin=resting["coin"], side=resting.get("side"),
+                reason="resting_cancelled", caller=resting.get("caller"),
+                trade_id=int(trade_id),
+                detail=f"could not re-place bracket after SL update to {new_stop}",
+            )
+            db.insert_skipped_trade(
+                trade_id=int(trade_id), coin=resting["coin"],
+                side=resting.get("side"), caller=resting.get("caller"),
+                reason="resting_cancelled",
+                detail=f"re-place failed after SL update to {new_stop}",
+            )
+        return
+
     opened = db.get_opened_trade(int(trade_id))
     if opened is None:
         return  # not one of ours
@@ -654,6 +707,38 @@ async def handle_full_close(event: dict) -> None:
     stop_triggered = bool(event.get("stop_triggered"))
     if trade_id is None:
         return
+
+    # Caller closed a trade whose resting bracket never filled → withdraw it.
+    resting = db.get_resting_entry(int(trade_id))
+    if resting is not None and not db.get_live_trade(int(trade_id)):
+        try:
+            if state.hl is not None:
+                await state.hl.cancel_resting_entry(
+                    trade_id=int(trade_id), portal_coin=resting["coin"],
+                )
+        except Exception:
+            log.exception("failed to cancel resting bracket #%s", trade_id)
+        db.remove_resting_entry(int(trade_id))
+        _push_activity(
+            "resting",
+            f"🕒 RESTING WITHDRAWN {resting['coin']} #{trade_id} (caller closed)",
+            int(trade_id),
+        )
+        notifier.notify_skipped(
+            coin=resting["coin"], side=resting.get("side"),
+            reason="resting_cancelled", caller=resting.get("caller"),
+            trade_id=int(trade_id),
+            detail="caller closed the trade before our resting entry filled",
+        )
+        db.insert_skipped_trade(
+            trade_id=int(trade_id), coin=resting["coin"],
+            side=resting.get("side"), caller=resting.get("caller"),
+            reason="resting_cancelled",
+            detail="caller closed before entry filled",
+        )
+        state.fire_refresh()
+        return
+
     if not db.get_live_trade(int(trade_id)):
         return
 
@@ -789,6 +874,72 @@ def _safe_notify(msg: str, type: str = "info") -> None:
         pass
 
 
+async def _place_resting_entry_for(
+    *,
+    trade_id: int,
+    coin: str,
+    side: str,
+    caller: Optional[str],
+    entry: Optional[float],
+    stop: Optional[float],
+    leverage: Optional[float],
+    mode: str,
+    margin_usd: float,
+    risk_usd: float,
+    available: Optional[float],
+) -> bool:
+    """Park a GTC bracket at the caller's entry instead of skipping forever.
+
+    Returns True if the bracket was placed and recorded (caller stops there);
+    False means resting isn't possible for this signal (no SL, k-coin, HL
+    rejection) and the normal skip path should proceed. Fill detection is the
+    existing reconcile/adoption path; expiry/cancel is the sweeper.
+    """
+    if state.hl is None or entry is None or stop is None or is_k_coin(coin):
+        return False
+    try:
+        res = await state.hl.place_resting_entry(
+            trade_id=int(trade_id), portal_coin=coin, side=side,
+            entry_px=float(entry), sl_px=float(stop), leverage=leverage,
+            sizing_mode=mode, margin_usd=margin_usd, risk_usd=risk_usd,
+            available_margin=available,
+        )
+    except HyperliquidValidationError as exc:
+        log.info("resting entry not possible #%s %s: %s", trade_id, coin, exc)
+        return False
+    except Exception:
+        log.exception("resting entry placement failed #%s %s", trade_id, coin)
+        return False
+
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(minutes=RESTING_ENTRY_TTL_MIN)
+    ).isoformat(timespec="seconds")
+    db.insert_resting_entry(
+        trade_id=int(trade_id), coin=coin, side=side, caller=caller,
+        entry_px=res["entry_px"], sl_px=res["sl_px"], size=res["size"],
+        expires_at=expires_at,
+    )
+    log.info(
+        "RESTING ENTRY #%s %s %s @ %s (sl=%s sz=%s, expires %s)",
+        trade_id, coin, side, res["entry_px"], res["sl_px"], res["size"],
+        expires_at,
+    )
+    _push_activity(
+        "resting",
+        f"🕒 RESTING {coin} {side.upper()} @ {_fmt_price(res['entry_px'])} "
+        f"#{trade_id} (waiting ≤{RESTING_ENTRY_TTL_MIN:g}m)",
+        int(trade_id),
+    )
+    notifier.notify_resting(
+        coin=coin, side=side, entry=res["entry_px"], sl=res["sl_px"],
+        ttl_minutes=RESTING_ENTRY_TTL_MIN, trade_id=int(trade_id),
+        dry_run=state.dry_run,
+    )
+    state.pending_trades.pop(int(trade_id), None)
+    state.fire_refresh()
+    return True
+
+
 async def enter_trade(trade_id: int) -> None:
     event = state.pending_trades.get(int(trade_id))
     if event is None:
@@ -810,17 +961,17 @@ async def enter_trade(trade_id: int) -> None:
     stop = event.get("stop_loss")
     caller = event.get("caller")
 
-    if db.is_coin_live(coin):
-        _safe_notify(f"BLOCKED: {coin} already live", "warning")
+    if db.is_coin_live(coin) or db.is_coin_resting(coin):
+        _safe_notify(f"BLOCKED: {coin} already live or resting", "warning")
         notifier.notify_skipped(
             coin=coin, side=side, reason="blocked_coin_live",
             caller=caller, trade_id=int(trade_id),
-            detail=f"{coin} already has an open position",
+            detail=f"{coin} already has an open position or resting entry",
         )
         db.insert_skipped_trade(
             trade_id=int(trade_id), coin=coin, side=side, caller=caller,
             reason="blocked_coin_live",
-            detail=f"{coin} already has an open position",
+            detail=f"{coin} already has an open position or resting entry",
         )
         return
     if state.hl is None:
@@ -885,12 +1036,26 @@ async def enter_trade(trade_id: int) -> None:
             available_margin=available,
         )
     except LevelSlippageExceeded as exc:
-        # Caller's entry is too far from current mid — refuse to chase.
+        # Caller's entry is too far from current mid — never chase. Instead,
+        # park a GTC bracket AT the caller's level: if price retraces within
+        # the TTL we fill exactly where they did; otherwise it expires.
         log.warning(
-            "ENTRY SLIPPED #%s %s — mid=%g vs called=%g drift=%.2f%% cap=%.2f%%",
+            "ENTRY SLIPPED #%s %s — mid=%g vs called=%g drift=%.2f%% cap=%.2f%% "
+            "→ attempting resting entry",
             trade_id, coin, exc.mid, exc.level,
             exc.drift_pct * 100, exc.slip_pct * 100,
         )
+        placed = await _place_resting_entry_for(
+            trade_id=int(trade_id), coin=coin, side=side, caller=caller,
+            entry=float(entry) if entry else None,
+            stop=float(stop) if stop else None,
+            leverage=event.get("leverage"),
+            mode=mode, margin_usd=margin_usd, risk_usd=risk_usd,
+            available=available,
+        )
+        if placed:
+            return
+        # Resting not possible (no SL / k-coin / HL rejection) → plain skip.
         _push_activity(
             "blocked",
             f"🎯 SLIPPED {coin} #{trade_id} (mid {_fmt_price(exc.mid)} vs "
@@ -899,7 +1064,8 @@ async def enter_trade(trade_id: int) -> None:
         )
         _slip_detail = (
             f"mid {_fmt_price(exc.mid)} vs called {_fmt_price(exc.level)} "
-            f"({exc.drift_pct*100:.2f}% drift > {exc.slip_pct*100:.2f}% cap)"
+            f"({exc.drift_pct*100:.2f}% drift > {exc.slip_pct*100:.2f}% cap); "
+            f"resting entry not possible"
         )
         notifier.notify_skipped(
             coin=coin, side=side, reason="entry_slipped", caller=caller,
@@ -1458,6 +1624,59 @@ async def periodic_reconcile_loop() -> None:
             await reconcile_on_startup()
         except Exception:
             log.exception("periodic reconcile failed (will retry next tick)")
+        try:
+            await _sweep_resting_entries()
+        except Exception:
+            log.exception("resting-entry sweep failed (will retry next tick)")
+
+
+async def _sweep_resting_entries() -> None:
+    """Graduate filled resting entries; cancel + record expired ones.
+
+    - Filled: the position appeared on HL → reconcile/adoption already
+      re-tracked it in hl_live_trades — we just drop the resting row.
+    - Expired: TTL passed without a fill → cancel the bracket on HL, drop the
+      row, and record the skip so /performance shows why it was missed.
+    """
+    for row in db.list_resting_entries():
+        tid = int(row["trade_id"])
+        if db.get_live_trade(tid) is not None:
+            db.remove_resting_entry(tid)
+            log.info(
+                "resting entry #%s %s GRADUATED (filled + adopted)",
+                tid, row["coin"],
+            )
+            continue
+        if db.resting_entry_expired(row):
+            try:
+                if state.hl is not None:
+                    await state.hl.cancel_resting_entry(
+                        trade_id=tid, portal_coin=row["coin"],
+                    )
+            except Exception:
+                log.exception("expiry cancel failed for resting #%s", tid)
+            db.remove_resting_entry(tid)
+            detail = (
+                f"unfilled after {RESTING_ENTRY_TTL_MIN:g} min at "
+                f"{row['entry_px']}"
+            )
+            log.info("resting entry #%s %s EXPIRED — %s", tid, row["coin"], detail)
+            _push_activity(
+                "resting",
+                f"⌛ RESTING EXPIRED {row['coin']} #{tid}",
+                tid,
+            )
+            notifier.notify_skipped(
+                coin=row["coin"], side=row.get("side"),
+                reason="resting_expired", caller=row.get("caller"),
+                trade_id=tid, detail=detail,
+            )
+            db.insert_skipped_trade(
+                trade_id=tid, coin=row["coin"], side=row.get("side"),
+                caller=row.get("caller"), reason="resting_expired",
+                detail=detail,
+            )
+            state.fire_refresh()
 
 
 async def hl_change_reconciler() -> None:
@@ -2325,6 +2544,7 @@ def _feed_color(kind: str) -> str:
         "sl_triggered":   "text-red-400",
         "blocked":        "text-yellow-500",
         "stale":          "text-orange-400",
+        "resting":        "text-purple-300",
     }.get(kind, "text-gray-400")
 
 

@@ -163,6 +163,23 @@ CREATE TABLE IF NOT EXISTS hl_skipped_trades (
 CREATE INDEX IF NOT EXISTS idx_skipped_trade_id ON hl_skipped_trades(trade_id);
 CREATE INDEX IF NOT EXISTS idx_skipped_at       ON hl_skipped_trades(at);
 
+-- Resting limit entries: when price has already drifted past the strict
+-- entry-slippage cap, the bot places a GTC limit bracket AT the caller's
+-- entry price instead of skipping forever. Rows here track those unfilled
+-- brackets until they fill (position appears → adoption re-tracks →
+-- "graduated"), the caller closes the trade, or the TTL expires.
+CREATE TABLE IF NOT EXISTS hl_resting_entries (
+    trade_id   INTEGER PRIMARY KEY,
+    coin       TEXT    NOT NULL,
+    side       TEXT    NOT NULL,
+    caller     TEXT,
+    entry_px   REAL    NOT NULL,
+    sl_px      REAL    NOT NULL,
+    size       REAL    NOT NULL,
+    placed_at  TEXT    NOT NULL,
+    expires_at TEXT    NOT NULL
+);
+
 -- Persisted portal trade outcomes (pnl%, close price, timestamps) captured
 -- from the rolling activity feed. The feed is a short window — once a trade
 -- scrolls off it, its outcome is gone. Persisting here keeps the
@@ -1039,6 +1056,78 @@ def get_skip_reason_counts() -> dict[str, int]:
         "SELECT reason, COUNT(*) AS n FROM hl_skipped_trades GROUP BY reason;"
     ).fetchall()
     return {r["reason"]: int(r["n"]) for r in rows}
+
+
+# ============================================================
+# SECTION: hl_resting_entries — GTC brackets waiting at the caller's entry
+# ============================================================
+
+def insert_resting_entry(
+    *,
+    trade_id: int,
+    coin: str,
+    side: str,
+    entry_px: float,
+    sl_px: float,
+    size: float,
+    expires_at: str,
+    caller: Optional[str] = None,
+    placed_at: Optional[str] = None,
+) -> None:
+    _execute(
+        """
+        INSERT OR REPLACE INTO hl_resting_entries
+            (trade_id, coin, side, caller, entry_px, sl_px, size,
+             placed_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            int(trade_id), coin, side, caller,
+            float(entry_px), float(sl_px), float(size),
+            placed_at or _utcnow_iso(), expires_at,
+        ),
+    )
+
+
+def get_resting_entry(trade_id: int) -> Optional[dict]:
+    row = _execute(
+        "SELECT * FROM hl_resting_entries WHERE trade_id = ?;",
+        (int(trade_id),),
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def remove_resting_entry(trade_id: int) -> None:
+    _execute(
+        "DELETE FROM hl_resting_entries WHERE trade_id = ?;",
+        (int(trade_id),),
+    )
+
+
+def list_resting_entries() -> list[dict]:
+    rows = _execute(
+        "SELECT * FROM hl_resting_entries ORDER BY placed_at ASC;"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def is_coin_resting(coin: str) -> bool:
+    """True if a resting entry bracket already exists for this coin —
+    used alongside is_coin_live to prevent stacking brackets."""
+    row = _execute(
+        "SELECT 1 FROM hl_resting_entries WHERE UPPER(coin) = UPPER(?) LIMIT 1;",
+        (coin,),
+    ).fetchone()
+    return row is not None
+
+
+def resting_entry_expired(row: dict, now_iso: Optional[str] = None) -> bool:
+    """Pure expiry check. Both timestamps come from _utcnow_iso (same
+    fixed-width ISO-8601 UTC format), so lexicographic compare is correct."""
+    exp = row.get("expires_at")
+    if not exp:
+        return False
+    return (now_iso or _utcnow_iso()) >= str(exp)
 
 
 # ============================================================
