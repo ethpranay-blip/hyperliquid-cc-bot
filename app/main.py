@@ -124,7 +124,8 @@ class AppState:
         # per-process (resets on restart). Controlled by AUTO_MODE env var.
         self.auto_mode: bool = os.environ.get("AUTO_MODE", "").lower() in ("1", "true", "yes")
         self.pending_trades: dict[int, dict] = {}  # trade_id -> new_trade event
-        self.activity_feed: deque[dict] = deque(maxlen=200)
+        # maxlen bounds the WebSocket state-sync payload (see DASH_FEED_ROWS).
+        self.activity_feed: deque[dict] = deque(maxlen=80)
         self.dry_run: bool = True
         self.refresh_callbacks: list = []
         # Unix-ms timestamp captured at on_startup; any trade whose portal
@@ -157,6 +158,14 @@ STALE_SLACK_MS = 5 * 60 * 1000
 # How long a resting GTC entry (parked at the caller's level after the live
 # mid drifted past the slippage cap) waits for a fill before being cancelled.
 RESTING_ENTRY_TTL_MIN = float(os.environ.get("RESTING_ENTRY_TTL_MINUTES", 60))
+
+# Dashboard render caps. NiceGUI syncs the whole page's element state to the
+# browser over a single WebSocket message; once it exceeds the transport limit
+# the client can never (re)connect ("Message too long" → the page freezes).
+# These bound the biggest row-sets so the sync stays small. Env-tunable.
+DASH_HISTORY_ROWS = int(os.environ.get("DASH_HISTORY_ROWS", 40))
+DASH_FEED_ROWS = int(os.environ.get("DASH_FEED_ROWS", 40))
+PERF_TABLE_ROWS = int(os.environ.get("PERF_TABLE_ROWS", 60))
 
 
 
@@ -2053,7 +2062,7 @@ def index() -> None:
 
             def refresh_history() -> None:
                 try:
-                    rows = db.get_historic_trades(limit=200)
+                    rows = db.get_historic_trades(limit=DASH_HISTORY_ROWS)
                 except Exception:
                     log.exception("history refresh failed")
                     return
@@ -2087,7 +2096,7 @@ def index() -> None:
                     if not state.activity_feed:
                         ui.label("— no events yet —").classes("text-xs opacity-60")
                         return
-                    for evt in list(state.activity_feed)[:60]:
+                    for evt in list(state.activity_feed)[:DASH_FEED_ROWS]:
                         color = _feed_color(evt["kind"])
                         with ui.row().classes("w-full no-wrap gap-2 items-baseline"):
                             ui.label(evt["at"]).classes("text-xs opacity-60")
@@ -2493,11 +2502,13 @@ async def performance_page() -> None:
                     rows=_caller_rows, row_key="caller",
                 ).classes("w-full")
 
-        # Per-trade table
+        # Per-trade table — capped so the WebSocket state-sync stays small.
         ui.label("Trade-level reconciliation").classes("text-base font-semibold mt-2")
-        ui.label("Newest first. Negative bot $ = realized loss.").classes("text-xs opacity-60")
+        ui.label(
+            f"Newest first, most recent {PERF_TABLE_ROWS}. Negative bot $ = realized loss."
+        ).classes("text-xs opacity-60")
         trade_rows = []
-        for r in reconciled:
+        for r in reconciled[:PERF_TABLE_ROWS]:
             trade_rows.append({
                 "trade_id": r.trade_id,
                 "coin": r.coin,
