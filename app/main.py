@@ -2713,6 +2713,15 @@ if __name__ in {"__main__", "__mp_main__"}:
         reload=False,
         show=False,
         dark=True,
+        # ROOT CAUSE of the "Message too long / too large for WebSocket
+        # transmission" freeze (seen even on the near-empty login page):
+        # NiceGUI buffers the last `message_history_length` outgoing messages
+        # per client to replay on reconnect. This bot pushes UI updates every
+        # 1–3s (activity feed + tick timers), so at the default 1000 the replay
+        # sent on (re)connect blows past the WebSocket size limit and the
+        # client can NEVER establish a working connection → every page freezes.
+        # A short buffer only needs to cover a brief network blip.
+        message_history_length=int(os.environ.get("DASH_MESSAGE_HISTORY", 50)),
         # Signs the app.storage.user session cookie. Without the env var a
         # random per-boot secret is used → sessions reset on every redeploy
         # (harmless: you just log in again). Set it to persist sessions.
