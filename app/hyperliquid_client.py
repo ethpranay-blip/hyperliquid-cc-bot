@@ -941,10 +941,16 @@ class HyperliquidClient:
         # Set per-asset leverage — best-effort; not atomic w/ order.
         # Margin mode comes from HL_MARGIN_MODE env (default isolated). This
         # used to be hardcoded cross=False, which silently overrode any UI
-        # margin-mode change the user made.
-        await self._set_leverage(
+        # margin-mode change the user made. We PROCEED even if it fails (don't
+        # miss the entry) but warn loudly — a silent miss could open at the
+        # wrong leverage.
+        if not await self._set_leverage(
             order_name, int(lev), cross=self.use_cross_margin, dex=dex,
-        )
+        ):
+            log.warning(
+                "OPEN #%s %s: leverage NOT confirmed at %dx — entering anyway; "
+                "verify the position's leverage on HL", trade_id, order_name, int(lev),
+            )
 
         # Build the atomic bracket
         entry_order = {
@@ -1023,26 +1029,37 @@ class HyperliquidClient:
 
     async def _set_leverage(
         self, hl_coin: str, leverage: int, *, cross: bool = False, dex: str = ""
-    ) -> None:
+    ) -> bool:
+        """Set per-asset leverage before an order. Returns True on confirmed
+        success. A failure is NOT silently swallowed anymore: it's logged at
+        WARNING and the caller surfaces it, because a silent failure means the
+        position could open at whatever leverage HL last had for the asset."""
         if self._exchange is None or self.dry_run:
-            return
+            return True
         exchange = self._exchange
 
         def _call():
             try:
                 return exchange.update_leverage(leverage, hl_coin, is_cross=cross)
             except TypeError:
-                try:
-                    return exchange.update_leverage(leverage, hl_coin, cross)
-                except Exception:
-                    return None
-            except Exception:
-                return None
+                return exchange.update_leverage(leverage, hl_coin, cross)
 
         try:
-            await asyncio.to_thread(_call)
+            resp = await asyncio.to_thread(_call)
         except Exception:
-            log.debug("set_leverage failed (non-fatal)", exc_info=True)
+            log.warning(
+                "set_leverage FAILED for %s @ %dx — order may open at HL's "
+                "prior leverage for this asset", hl_coin, leverage, exc_info=True,
+            )
+            return False
+        # HL returns {"status": "ok"} on success.
+        if isinstance(resp, dict) and resp.get("status") != "ok":
+            log.warning(
+                "set_leverage rejected for %s @ %dx: %r — order may open at "
+                "HL's prior leverage", hl_coin, leverage, resp,
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Close — reduce-only market IOC (full)
@@ -1529,7 +1546,18 @@ class HyperliquidClient:
         entry_r = round_px(float(entry_px), sz_dec)
         sl_r = round_px(float(sl_px), sz_dec)
 
-        # Size at the caller's entry — that IS the fill price if this executes.
+        # Resting limit sits at the SLIPPAGE BOUNDARY, not the exact level, so
+        # it fills the instant price comes back within the entry cap (0.5%) —
+        # not only at the caller's exact price. "Don't miss the entry": fill
+        # anywhere within 0.5%, expire only if it never returns to the band.
+        entry_slip = get_entry_slip_pct()
+        entry_limit = round_px(
+            slippage_capped_limit(level=float(entry_px), is_buy=is_buy,
+                                  slip_pct=entry_slip),
+            sz_dec,
+        )
+
+        # Size at the caller's entry — that IS the reference fill price.
         try:
             size, size_basis = compute_position_size(
                 mode=sizing_mode,
@@ -1543,9 +1571,10 @@ class HyperliquidClient:
             raise HyperliquidValidationError(str(exc))
 
         log.info(
-            "RESTING %s #%s %s GTC entry=%s sl=%s sz=%s lev=%sx [%s] dry_run=%s",
-            order_name, trade_id, side_l, entry_r, sl_r, size, lev,
-            size_basis, self.dry_run,
+            "RESTING %s #%s %s GTC entry=%s (limit@%s, %.2f%% band) sl=%s "
+            "sz=%s lev=%sx [%s] dry_run=%s",
+            order_name, trade_id, side_l, entry_r, entry_limit,
+            entry_slip * 100, sl_r, size, lev, size_basis, self.dry_run,
         )
 
         entry_cloid = cloid_for(trade_id)
@@ -1561,14 +1590,18 @@ class HyperliquidClient:
         if self._exchange is None:
             raise HyperliquidError("SDK not initialized (missing credentials)")
 
-        await self._set_leverage(
+        if not await self._set_leverage(
             order_name, int(lev), cross=self.use_cross_margin, dex=dex,
-        )
+        ):
+            log.warning(
+                "RESTING #%s %s: leverage NOT confirmed at %dx — resting anyway; "
+                "verify on HL if it fills", trade_id, order_name, int(lev),
+            )
 
         orders = [
             {
                 "coin": order_name, "is_buy": is_buy, "sz": size,
-                "limit_px": entry_r,
+                "limit_px": entry_limit,   # 0.5% boundary → fills within the band
                 "order_type": {"limit": {"tif": "Gtc"}},
                 "reduce_only": False, "cloid": entry_cloid,
             },

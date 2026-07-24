@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS hl_sl_updates (
     size                 REAL,
     original_size        REAL,
     trigger_conditions   TEXT,
+    source               TEXT,   -- 'caller' (broadcast move) | 'auto' (bot trail) | NULL (legacy)
     at                   TEXT    NOT NULL
 );
 
@@ -237,6 +238,14 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             "ALTER TABLE hl_opened_trades ADD COLUMN my_fill_price REAL;"
         )
         log.info("migration: added hl_opened_trades.my_fill_price")
+
+    # 'source' distinguishes a caller-broadcast SL move ('caller') from the
+    # bot's own auto-trail ('auto'). Rows predating this column read as NULL,
+    # which has_caller_sl_move() treats as 'not a caller move' — so existing
+    # live trades keep auto-trailing exactly as before.
+    if not _has_col("hl_sl_updates", "source"):
+        conn.execute("ALTER TABLE hl_sl_updates ADD COLUMN source TEXT;")
+        log.info("migration: added hl_sl_updates.source")
 
 
 def init_db(db_path: Optional[str | Path] = None) -> None:
@@ -515,14 +524,15 @@ def insert_sl_update(
     size: Optional[float] = None,
     original_size: Optional[float] = None,
     trigger_conditions: Optional[str] = None,
+    source: Optional[str] = None,
     at: Optional[str] = None,
 ) -> int:
     cur = _execute(
         """
         INSERT INTO hl_sl_updates
             (trade_id, old_stop, new_stop, size, original_size,
-             trigger_conditions, at)
-        VALUES (?, ?, ?, ?, ?, ?, ?);
+             trigger_conditions, source, at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             int(trade_id),
@@ -531,10 +541,24 @@ def insert_sl_update(
             None if size is None else float(size),
             None if original_size is None else float(original_size),
             trigger_conditions,
+            source,
             at or _utcnow_iso(),
         ),
     )
     return int(cur.lastrowid)
+
+
+def has_caller_sl_move(trade_id: int) -> bool:
+    """True if the caller has broadcast at least one explicit SL move for this
+    trade (source='caller'). The auto-trail defers entirely to the caller once
+    this is true — the caller's own stop management wins; the auto-BE ladder is
+    only the fallback for when they stay silent."""
+    row = _execute(
+        "SELECT 1 FROM hl_sl_updates WHERE trade_id = ? AND source = 'caller' "
+        "LIMIT 1;",
+        (int(trade_id),),
+    ).fetchone()
+    return row is not None
 
 
 def insert_tp_update(
