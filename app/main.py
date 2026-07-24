@@ -2201,12 +2201,25 @@ async def performance_page() -> None:
             log.exception("performance: load persisted portal trades failed")
             persisted_portal = {}
 
+        # Latest skip reason per trade_id (oldest→newest so newest wins) —
+        # lets the analyzer price WHAT each miss cost, split by WHY.
+        try:
+            skip_map = {
+                int(r["trade_id"]): r["reason"]
+                for r in reversed(db.list_skipped_trades(limit=5000))
+                if r.get("trade_id") is not None
+            }
+        except Exception:
+            log.exception("performance: skip-reason load failed")
+            skip_map = {}
+
         reconciled = _perf_reconcile(
             portal_events=portal_events,
             bot_opens=bot_opens, bot_closeds=bot_closeds,
             bot_live_ids=bot_live_ids,
             allowed_callers=allowed_callers,
             extra_portal_trades=persisted_portal,
+            skip_reasons=skip_map,
         )
         summary = _perf_summarize(
             reconciled, per_trade_margin_usd=per_trade_margin,
@@ -2256,8 +2269,121 @@ async def performance_page() -> None:
                 "included (no unrealized PnL shown)."
             )
 
+        taken = summary["taken"]
+        missed = summary["missed"]
+
+        def _usd_or_dash(v, fmt="${:,.2f}"):
+            return fmt.format(v) if v is not None else "—"
+
+        # ═══════════ HERO — the numbers that answer "is the bot working" ═══════════
+        ui.label("At a glance").classes("text-lg font-bold")
+        with ui.row().classes("gap-3 flex-wrap"):
+            _metric(
+                "Bot realized PnL",
+                _signed(summary["bot_total_usd"]),
+                f"{taken['count']} closed · win rate {summary['bot_win_rate']*100:.0f}% "
+                f"· fees ${summary['bot_fees_usd']:.2f}",
+                _signed_cls(summary["bot_total_usd"]),
+            )
+            _metric(
+                "Avg per trade",
+                _signed(taken["avg_pnl_usd"]),
+                f"best {_signed(taken['best_usd'])} · worst {_signed(taken['worst_usd'])}",
+                _signed_cls(taken["avg_pnl_usd"]),
+            )
+            _metric(
+                "Avg margin / trade",
+                _usd_or_dash(taken["avg_margin_usd"]),
+                f"avg position size {_usd_or_dash(taken['avg_notional_usd'])} notional",
+            )
+            _metric(
+                "Missed trades cost",
+                _signed(missed["portal_usd"]),
+                f"{missed['count']} missed · {missed['completed']} with known outcome "
+                f"(at ${per_trade_margin:.0f}/trade)",
+                # positive missed $ = money left on the table = BAD → red
+                "perf-neg" if (missed["portal_usd"] or 0) > 0 else "perf-pos",
+            )
+
+        # ═══════════ MISSED TRADES — what each skip reason cost ═══════════
+        if missed["by_reason"]:
+            ui.label("What missed trades cost — by skip reason").classes(
+                "text-base font-semibold mt-2"
+            )
+            ui.label(
+                "Portal outcome of every trade the bot did NOT take, priced at "
+                f"${per_trade_margin:.0f}/trade. Positive bar = money left on the "
+                "table by that skip reason; negative = those skips dodged losers. "
+                "This is the chart that says which guard to tune."
+            ).classes("text-xs opacity-60")
+            _reason_labels = {
+                "stale": "🕰️ Stale (bot restart)",
+                "blocked_coin_live": "🚫 Coin already live",
+                "insufficient_margin": "💸 Insufficient margin",
+                "entry_slipped": "🎯 Entry slipped",
+                "ticker_not_found": "❓ Not on HL",
+                "resting_expired": "⌛ Resting expired",
+                "resting_cancelled": "🕒 Resting cancelled",
+                "unknown": "⚠️ Unrecorded (pre-tracking)",
+            }
+            _rows = summary["missed"]["by_reason"]
+            try:
+                ui.echart({
+                    "backgroundColor": "transparent",
+                    "tooltip": {"trigger": "axis",
+                                "axisPointer": {"type": "shadow"}},
+                    "grid": {"left": 220, "right": 80, "top": 10, "bottom": 30},
+                    "xAxis": {
+                        "type": "value",
+                        "axisLabel": {"color": "#a0aec0", "formatter": "${value}"},
+                        "splitLine": {"lineStyle": {"color": "#2d3748"}},
+                    },
+                    "yAxis": {
+                        "type": "category",
+                        "data": [
+                            f"{_reason_labels.get(s['reason'], s['reason'])}  "
+                            f"({s['count']}×)"
+                            for s in reversed(_rows)
+                        ],
+                        "axisLabel": {"color": "#e2e8f0", "fontSize": 13},
+                    },
+                    "series": [{
+                        "type": "bar", "barMaxWidth": 30,
+                        "label": {"show": True, "position": "right",
+                                  "color": "#e2e8f0", "formatter": "${c}"},
+                        "data": [
+                            {
+                                "value": round(s["portal_usd"], 2),
+                                "itemStyle": {
+                                    "color": "#fc8181" if s["portal_usd"] > 0
+                                    else "#48bb78",
+                                    "borderRadius": 4,
+                                },
+                            }
+                            for s in reversed(_rows)
+                        ],
+                    }],
+                }).classes("w-full").style(
+                    f"height: {max(160, 60 * len(_rows) + 60)}px;"
+                )
+            except Exception:
+                log.debug("ui.echart unavailable for missed-by-reason", exc_info=True)
+                for s in _rows:
+                    ui.label(
+                        f"{_reason_labels.get(s['reason'], s['reason'])}: "
+                        f"{s['count']}× → {_signed(s['portal_usd'])}"
+                    ).classes("text-sm")
+            if missed["biggest_missed"]:
+                bm = missed["biggest_missed"]
+                ui.label(
+                    f"😬 Biggest single miss: {bm['coin']} #{bm['trade_id']} "
+                    f"({bm['caller'] or '?'}) — would have made "
+                    f"{_signed(bm['portal_usd'])} · skipped because: "
+                    f"{_reason_labels.get(bm['reason'], bm['reason'])}"
+                ).classes("text-sm perf-caveat w-full")
+
         # Headline: direct apples-to-apples comparison
-        ui.label("Direct comparison — trades present on both sides").classes("text-base font-semibold")
+        ui.label("Direct comparison — trades present on both sides").classes("text-base font-semibold mt-2")
         if summary["direct_count"] == 0:
             ui.label(
                 "No trades currently match on both sides. Your bot's closed "
@@ -2302,7 +2428,8 @@ async def performance_page() -> None:
                         "axisPointer": {"type": "cross"},
                     },
                     "legend": {
-                        "data": ["Portal hypothetical $", "Bot actual $"],
+                        "data": ["Portal hypothetical $", "Bot actual $",
+                                 "Missed trades (cost) $"],
                         "textStyle": {"color": "#e2e8f0"},
                         "top": 4,
                     },
@@ -2334,6 +2461,14 @@ async def performance_page() -> None:
                             "itemStyle": {"color": "#f6ad55"},
                             "areaStyle": {"opacity": 0.08, "color": "#f6ad55"},
                             "data": curves["bot"],
+                        },
+                        {
+                            "name": "Missed trades (cost) $", "type": "line",
+                            "step": "end", "showSymbol": True, "symbolSize": 5,
+                            "lineStyle": {"width": 2, "color": "#fc8181",
+                                          "type": "dashed"},
+                            "itemStyle": {"color": "#fc8181"},
+                            "data": curves.get("missed", []),
                         },
                     ],
                 }).classes("w-full").style("height: 360px;")
@@ -2523,8 +2658,17 @@ async def performance_page() -> None:
                     if r.portal_pnl_pct is not None else "—"
                 ),
                 "bot_pnl_usd": _signed(r.bot_pnl_usd) if r.bot_pnl_usd is not None else "—",
+                "bot_margin": (
+                    f"${r.bot_margin_usd:,.0f}" if r.bot_margin_usd else "—"
+                ),
+                "bot_notional": (
+                    f"${r.bot_notional_usd:,.0f}" if r.bot_notional_usd else "—"
+                ),
                 "bot_fee_usd": (
                     f"${r.bot_fee_usd:.2f}" if r.bot_fee_usd is not None else "—"
+                ),
+                "skip_reason": r.skip_reason or (
+                    "—" if r.bot_status != STATUS_MISSED else "unrecorded"
                 ),
             })
         ui.table(
@@ -2534,10 +2678,13 @@ async def performance_page() -> None:
                 {"name": "side", "label": "Side", "field": "side"},
                 {"name": "caller", "label": "Caller", "field": "caller", "sortable": True},
                 {"name": "status", "label": "Status", "field": "status", "sortable": True},
+                {"name": "skip_reason", "label": "Skip reason", "field": "skip_reason", "sortable": True},
                 {"name": "portal_pnl_pct", "label": "Portal %", "field": "portal_pnl_pct"},
                 {"name": "portal_pnl_usd", "label": "Portal $", "field": "portal_pnl_usd"},
                 {"name": "bot_pnl_usd", "label": "Bot $", "field": "bot_pnl_usd"},
-                {"name": "bot_fee_usd", "label": "Bot fee", "field": "bot_fee_usd"},
+                {"name": "bot_margin", "label": "Margin", "field": "bot_margin"},
+                {"name": "bot_notional", "label": "Size $", "field": "bot_notional"},
+                {"name": "bot_fee_usd", "label": "Fee", "field": "bot_fee_usd"},
             ],
             rows=trade_rows, row_key="trade_id",
             pagination={"rowsPerPage": 50},
