@@ -193,7 +193,7 @@ CREATE TABLE IF NOT EXISTS portal_trades (
     caller       TEXT,
     opened_at    INTEGER,   -- epoch ms
     closed_at    INTEGER,   -- epoch ms, NULL while still open
-    pnl_pct      REAL,      -- decimal (0.15 = +15%), NULL until closed
+    pnl_pct      REAL,      -- PERCENTAGE POINTS as the feed sends it (3.03 = +3.03%); reconcile /100s it. NULL until closed
     close_price  REAL,
     last_seen_at TEXT NOT NULL
 );

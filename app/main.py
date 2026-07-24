@@ -2232,18 +2232,32 @@ async def performance_page() -> None:
             extra_portal_trades=persisted_portal,
             skip_reasons=skip_map,
         )
+        # Representative NOTIONAL for pricing the caller's % move — the bot's
+        # own average position size, so portal $ is comparable to the bot's
+        # realized (leveraged) PnL. Taken trades carry their real notional;
+        # this only prices the ones we missed. Fallback (no history yet):
+        # current margin × a conservative default leverage.
+        _taken_notionals = [
+            r.bot_notional_usd for r in reconciled
+            if r.bot_notional_usd
+            and r.bot_status in (STATUS_COPIED_CLOSED, STATUS_BOT_ONLY)
+        ]
+        per_trade_notional = (
+            sum(_taken_notionals) / len(_taken_notionals)
+            if _taken_notionals else per_trade_margin * 10.0
+        )
         summary = _perf_summarize(
-            reconciled, per_trade_margin_usd=per_trade_margin,
+            reconciled, per_trade_notional_usd=per_trade_notional,
         )
         curves = _perf_cumulative(
-            reconciled, per_trade_margin_usd=per_trade_margin,
+            reconciled, per_trade_notional_usd=per_trade_notional,
         )
         verdict = _perf_windows(
-            reconciled, per_trade_margin_usd=per_trade_margin,
+            reconciled, per_trade_notional_usd=per_trade_notional,
             now_ms=int(time.time() * 1000),
         )
         weeks = _perf_weekly(
-            reconciled, per_trade_margin_usd=per_trade_margin,
+            reconciled, per_trade_notional_usd=per_trade_notional,
         )
     except Exception as exc:
         container.clear()
@@ -2305,9 +2319,12 @@ async def performance_page() -> None:
         # ══════════════ 1 · THE VERDICT ══════════════
         ui.label("📊 The verdict").classes("text-lg font-bold")
         ui.label(
-            "Same yardstick everywhere: every portal call priced at "
-            f"${per_trade_margin:.0f} margin per trade. “If nothing missed” = "
-            "bot’s real PnL + what its skipped trades would have done."
+            "Callers’ calls are priced at the bot’s position SIZE — the real "
+            "notional on trades we took, our typical "
+            f"~${per_trade_notional:,.0f} on ones we missed — so it’s "
+            "comparable to the bot’s real, leveraged PnL (not margin × %). "
+            "“If nothing missed” = bot’s real PnL + what its skipped trades "
+            "would have done at that size."
         ).classes("text-xs opacity-60")
         _v_cols = [
             {"name": "label", "label": "Window", "field": "label"},
@@ -2476,15 +2493,26 @@ async def performance_page() -> None:
             try:
                 ui.echart({
                     "backgroundColor": "transparent",
-                    "tooltip": {"trigger": "axis",
-                                "axisPointer": {"type": "shadow"}},
+                    # abs() the tooltip: the green "saved" bar is stored
+                    # NEGATIVE for the diverging layout, but must READ positive.
+                    "tooltip": {
+                        "trigger": "axis",
+                        "axisPointer": {"type": "shadow"},
+                        ":formatter": (
+                            "function(ps){var t=(ps[0]&&ps[0].name)?ps[0].name"
+                            "+'<br/>':'';for(var i=0;i<ps.length;i++){var v="
+                            "Math.abs(ps[i].value);if(v>0){t+=ps[i].marker+ps[i]"
+                            ".seriesName+': $'+v.toFixed(2)+'<br/>';}}return t;}"
+                        ),
+                    },
                     "legend": {"data": ["Saved us $", "Cost us $"],
                                "textStyle": {"color": "#e2e8f0"}, "top": 0},
                     "grid": {"left": 250, "right": 90, "top": 34, "bottom": 30},
                     "xAxis": {
                         "type": "value",
-                        "axisLabel": {"color": "#a0aec0",
-                                      "formatter": "${value}"},
+                        # Bars carry their own +$ labels; hide the axis so the
+                        # left (negative) half never shows a "-$" tick.
+                        "axisLabel": {"show": False},
                         "splitLine": {"lineStyle": {"color": "#2d3748"}},
                     },
                     "yAxis": {
@@ -2498,10 +2526,12 @@ async def performance_page() -> None:
                             "itemStyle": {"color": "#48bb78",
                                           "borderRadius": [4, 0, 0, 4]},
                             "label": {"show": True, "position": "left",
-                                      "color": "#9ae6b4",
-                                      "formatter": "${c}"},
+                                      "color": "#9ae6b4"},
                             "data": [
-                                -round(s["saved_usd"], 2)
+                                {"value": -round(s["saved_usd"], 2),
+                                 "label": {"formatter": (
+                                     f"${s['saved_usd']:,.2f}"
+                                     if s["saved_usd"] else "")}}
                                 for s in reversed(_rows)
                             ],
                         },
@@ -2511,10 +2541,12 @@ async def performance_page() -> None:
                             "itemStyle": {"color": "#fc8181",
                                           "borderRadius": [0, 4, 4, 0]},
                             "label": {"show": True, "position": "right",
-                                      "color": "#feb2b2",
-                                      "formatter": "${c}"},
+                                      "color": "#feb2b2"},
                             "data": [
-                                round(s["cost_usd"], 2)
+                                {"value": round(s["cost_usd"], 2),
+                                 "label": {"formatter": (
+                                     f"${s['cost_usd']:,.2f}"
+                                     if s["cost_usd"] else "")}}
                                 for s in reversed(_rows)
                             ],
                         },
@@ -2542,7 +2574,7 @@ async def performance_page() -> None:
         if weeks["labels"]:
             ui.label("Week by week").classes("text-lg font-bold mt-4")
             ui.label(
-                "Weekly PnL, same $-per-trade yardstick. Blue = all callers’ "
+                "Weekly PnL, priced at the bot’s size. Blue = all callers’ "
                 "calls · orange = bot actual · red = what the missed ones did."
             ).classes("text-xs opacity-60")
             try:
@@ -2642,11 +2674,12 @@ async def performance_page() -> None:
             with ui.row().classes("gap-3 flex-wrap"):
                 _metric("Portal (matched only)",
                         _signed(summary["direct_portal_usd"]),
-                        f"{summary['direct_count']} matched trades",
+                        f"{summary['direct_count']} trades · caller’s move at our size",
                         _signed_cls(summary["direct_portal_usd"]))
                 _metric("Bot (matched only)",
-                        _signed(summary["direct_bot_usd"]), "after fees",
-                        _signed_cls(summary["direct_bot_usd"]))
+                        _signed(summary["direct_bot_net_usd"]),
+                        f"after ${summary['direct_bot_fees_usd']:.2f} fees",
+                        _signed_cls(summary["direct_bot_net_usd"]))
                 _metric("Gap (bot − portal)",
                         _signed(summary["direct_diff_usd"]),
                         "negative = bot underperformed on shared trades",
@@ -2654,8 +2687,8 @@ async def performance_page() -> None:
                 _metric(
                     f"ALL portal calls ({summary['portal_completed_count']})",
                     _signed(summary["portal_total_usd"]),
-                    f"win rate {summary['portal_win_rate']*100:.0f}% — every "
-                    f"completed call at ${per_trade_margin:.0f}/trade",
+                    f"win rate {summary['portal_win_rate']*100:.0f}% — each "
+                    f"call at the bot’s size (~${per_trade_notional:,.0f} notional)",
                     _signed_cls(summary["portal_total_usd"]),
                 )
             if curves["portal"] or curves["bot"]:
@@ -2721,7 +2754,8 @@ async def performance_page() -> None:
                         if r.portal_pnl_pct is not None else "—"
                     ),
                     "portal_pnl_usd": (
-                        _signed(r.portal_pnl_pct * per_trade_margin)
+                        _signed(r.portal_pnl_pct
+                                * (r.bot_notional_usd or per_trade_notional))
                         if r.portal_pnl_pct is not None else "—"
                     ),
                     "bot_pnl_usd": (
