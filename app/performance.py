@@ -63,6 +63,14 @@ class ReconciledTrade:
     bot_entry_price: Optional[float] = None
     bot_exit_price: Optional[float] = None
     bot_closed_at: Optional[int] = None      # epoch ms, parsed from row "at"
+    bot_margin_usd: Optional[float] = None   # margin the bot committed
+    skip_reason: Optional[str] = None        # why a MISSED trade was skipped
+
+    @property
+    def bot_notional_usd(self) -> Optional[float]:
+        if self.bot_size is None or self.bot_entry_price is None:
+            return None
+        return self.bot_size * self.bot_entry_price
 
 
 def _int_or_none(v: Any) -> Optional[int]:
@@ -155,6 +163,7 @@ def reconcile(
     bot_live_ids: set[int],
     allowed_callers: set[str],
     extra_portal_trades: Optional[dict[int, dict]] = None,
+    skip_reasons: Optional[dict[int, str]] = None,
 ) -> list[ReconciledTrade]:
     """Build the per-trade reconciliation list.
 
@@ -232,6 +241,7 @@ def reconcile(
             rt.bot_entry_price = _float_or_none(bc.get("entry_price"))
             rt.bot_exit_price = _float_or_none(bc.get("exit_price"))
             rt.bot_closed_at = _iso_to_ms(bc.get("closed_at") or bc.get("at"))
+            rt.bot_margin_usd = _float_or_none(bc.get("margin"))
         elif tid in bot_live_set:
             rt.bot_status = STATUS_COPIED_OPEN
             if tid in bot_open_by_id:
@@ -243,6 +253,8 @@ def reconcile(
             rt.bot_entry_price = _float_or_none(bot_open_by_id[tid].get("entry_price"))
         else:
             rt.bot_status = STATUS_MISSED
+            if skip_reasons:
+                rt.skip_reason = skip_reasons.get(tid)
         reconciled.append(rt)
 
     # --- Step 4: append bot-only trades (portal feed has rolled off) ---
@@ -264,6 +276,7 @@ def reconcile(
             bot_entry_price=_float_or_none(bc.get("entry_price")),
             bot_exit_price=_float_or_none(bc.get("exit_price")),
             bot_closed_at=_iso_to_ms(bc.get("closed_at") or bc.get("at")),
+            bot_margin_usd=_float_or_none(bc.get("margin")),
         ))
 
     # --- Step 5: sort newest-first by opened-at (portal) else by bot info ---
@@ -345,7 +358,61 @@ def summarize(
 
     by_caller_list = sorted(by_caller.values(), key=lambda x: -x["portal_completed"])
 
+    # --- Taken-trade execution stats (what did OUR trades look like) ---
+    margins = [r.bot_margin_usd for r in bot_closed if r.bot_margin_usd]
+    notionals = [r.bot_notional_usd for r in bot_closed if r.bot_notional_usd]
+    taken_stats = {
+        "count": len(bot_closed),
+        "avg_margin_usd": (sum(margins) / len(margins)) if margins else None,
+        "avg_notional_usd": (sum(notionals) / len(notionals)) if notionals else None,
+        "avg_pnl_usd": (bot_all_usd / len(bot_closed)) if bot_closed else None,
+        "best_usd": max((r.bot_pnl_usd for r in bot_closed), default=None),
+        "worst_usd": min((r.bot_pnl_usd for r in bot_closed), default=None),
+    }
+
+    # --- Missed-trade cost, split by WHY it was skipped ---
+    # $ = portal_pnl_pct × per_trade_margin: what the same completed portal
+    # trade would have made/lost at your per-trade margin. Positive total =
+    # money left on the table; negative = the skips dodged losers.
+    missed = [r for r in reconciled if r.bot_status == STATUS_MISSED]
+    missed_by_reason: dict[str, dict] = {}
+    for r in missed:
+        reason = r.skip_reason or "unknown"
+        s = missed_by_reason.setdefault(reason, {
+            "reason": reason, "count": 0, "completed": 0, "portal_usd": 0.0,
+        })
+        s["count"] += 1
+        if r.portal_pnl_pct is not None:
+            s["completed"] += 1
+            s["portal_usd"] += r.portal_pnl_pct * per_trade_margin_usd
+    missed_completed = [r for r in missed if r.portal_pnl_pct is not None]
+    biggest_missed = max(
+        missed_completed, key=lambda r: r.portal_pnl_pct, default=None,
+    )
+    missed_stats = {
+        "count": len(missed),
+        "completed": len(missed_completed),
+        "portal_usd": sum(
+            r.portal_pnl_pct * per_trade_margin_usd for r in missed_completed
+        ),
+        "by_reason": sorted(
+            missed_by_reason.values(), key=lambda s: -abs(s["portal_usd"]),
+        ),
+        "biggest_missed": (
+            {
+                "trade_id": biggest_missed.trade_id,
+                "coin": biggest_missed.coin,
+                "caller": biggest_missed.caller,
+                "portal_usd": biggest_missed.portal_pnl_pct * per_trade_margin_usd,
+                "reason": biggest_missed.skip_reason or "unknown",
+            }
+            if biggest_missed is not None else None
+        ),
+    }
+
     return {
+        "taken": taken_stats,
+        "missed": missed_stats,
         # Direct comparison (apples-to-apples)
         "direct_count": len(direct),
         "direct_portal_usd": direct_portal_usd,
@@ -387,11 +454,14 @@ def cumulative_series(
     """
     portal_pts: list[tuple[int, float]] = []
     bot_pts: list[tuple[int, float]] = []
+    missed_pts: list[tuple[int, float]] = []
     for r in reconciled:
         if r.portal_pnl_pct is not None and r.portal_closed_at:
-            portal_pts.append(
-                (int(r.portal_closed_at), r.portal_pnl_pct * per_trade_margin_usd)
-            )
+            usd = r.portal_pnl_pct * per_trade_margin_usd
+            portal_pts.append((int(r.portal_closed_at), usd))
+            if r.bot_status == STATUS_MISSED:
+                # The "cost of missing" curve — same trades, never taken.
+                missed_pts.append((int(r.portal_closed_at), usd))
         if r.bot_pnl_usd is not None and r.bot_closed_at:
             bot_pts.append((int(r.bot_closed_at), float(r.bot_pnl_usd)))
 
@@ -403,4 +473,8 @@ def cumulative_series(
             out.append([ts, round(total, 2)])
         return out
 
-    return {"portal": _accumulate(portal_pts), "bot": _accumulate(bot_pts)}
+    return {
+        "portal": _accumulate(portal_pts),
+        "bot": _accumulate(bot_pts),
+        "missed": _accumulate(missed_pts),
+    }
