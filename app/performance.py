@@ -380,21 +380,34 @@ def summarize(
         reason = r.skip_reason or "unknown"
         s = missed_by_reason.setdefault(reason, {
             "reason": reason, "count": 0, "completed": 0, "portal_usd": 0.0,
+            # Unambiguous split (both stored POSITIVE) so the UI never has to
+            # show a green negative "cost":
+            #   cost_usd  = missed WINNERS → profit left on the table (bad)
+            #   saved_usd = missed LOSERS  → losses the skip dodged (good)
+            "cost_usd": 0.0, "saved_usd": 0.0,
         })
         s["count"] += 1
         if r.portal_pnl_pct is not None:
             s["completed"] += 1
-            s["portal_usd"] += r.portal_pnl_pct * per_trade_margin_usd
+            usd = r.portal_pnl_pct * per_trade_margin_usd
+            s["portal_usd"] += usd
+            if usd > 0:
+                s["cost_usd"] += usd
+            else:
+                s["saved_usd"] += -usd
     missed_completed = [r for r in missed if r.portal_pnl_pct is not None]
     biggest_missed = max(
         missed_completed, key=lambda r: r.portal_pnl_pct, default=None,
     )
+    _missed_usds = [
+        r.portal_pnl_pct * per_trade_margin_usd for r in missed_completed
+    ]
     missed_stats = {
         "count": len(missed),
         "completed": len(missed_completed),
-        "portal_usd": sum(
-            r.portal_pnl_pct * per_trade_margin_usd for r in missed_completed
-        ),
+        "portal_usd": sum(_missed_usds),
+        "winners_cost_usd": sum(u for u in _missed_usds if u > 0),
+        "losers_saved_usd": sum(-u for u in _missed_usds if u < 0),
         "by_reason": sorted(
             missed_by_reason.values(), key=lambda s: -abs(s["portal_usd"]),
         ),
@@ -477,4 +490,93 @@ def cumulative_series(
         "portal": _accumulate(portal_pts),
         "bot": _accumulate(bot_pts),
         "missed": _accumulate(missed_pts),
+    }
+
+
+_DAY_MS = 86_400_000
+
+
+def window_summary(
+    reconciled: list[ReconciledTrade],
+    *,
+    per_trade_margin_usd: float,
+    now_ms: int,
+    windows: tuple = ((7, "7D"), (30, "30D"), (90, "90D"), (None, "All time")),
+) -> list[dict]:
+    """Per-timeframe verdict rows: portal vs bot vs bot-if-nothing-missed.
+
+    combined_usd = bot actual + hypothetical PnL of the missed trades that
+    closed in the window ("what if we'd taken everything we skipped").
+    `now_ms` injected for testability.
+    """
+    out = []
+    for days, label in windows:
+        cutoff = None if days is None else now_ms - days * _DAY_MS
+        portal_rows = [
+            r for r in reconciled
+            if r.portal_pnl_pct is not None and r.portal_closed_at
+            and (cutoff is None or r.portal_closed_at >= cutoff)
+        ]
+        bot_rows = [
+            r for r in reconciled
+            if r.bot_pnl_usd is not None and r.bot_closed_at
+            and (cutoff is None or r.bot_closed_at >= cutoff)
+        ]
+        missed_usd = sum(
+            r.portal_pnl_pct * per_trade_margin_usd
+            for r in portal_rows if r.bot_status == STATUS_MISSED
+        )
+        bot_usd = sum(r.bot_pnl_usd for r in bot_rows)
+        out.append({
+            "label": label,
+            "portal_usd": sum(
+                r.portal_pnl_pct * per_trade_margin_usd for r in portal_rows
+            ),
+            "portal_n": len(portal_rows),
+            "bot_usd": bot_usd,
+            "bot_n": len(bot_rows),
+            "missed_usd": missed_usd,
+            "combined_usd": bot_usd + missed_usd,
+        })
+    return out
+
+
+def weekly_pnl(
+    reconciled: list[ReconciledTrade],
+    *,
+    per_trade_margin_usd: float,
+) -> dict:
+    """Per-week PnL buckets (Mon-start, UTC) for grouped bar charts —
+    the dumbed-down replacement for cumulative line curves.
+
+    Returns {"labels": [...], "portal": [...], "bot": [...], "missed": [...]}
+    aligned by index, oldest week first.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    buckets: dict = {}
+
+    def _slot(ts_ms: int):
+        d = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        monday = (d - timedelta(days=d.weekday())).date()
+        return buckets.setdefault(
+            monday, {"portal": 0.0, "bot": 0.0, "missed": 0.0}
+        )
+
+    for r in reconciled:
+        if r.portal_pnl_pct is not None and r.portal_closed_at:
+            usd = r.portal_pnl_pct * per_trade_margin_usd
+            slot = _slot(int(r.portal_closed_at))
+            slot["portal"] += usd
+            if r.bot_status == STATUS_MISSED:
+                slot["missed"] += usd
+        if r.bot_pnl_usd is not None and r.bot_closed_at:
+            _slot(int(r.bot_closed_at))["bot"] += float(r.bot_pnl_usd)
+
+    days = sorted(buckets)
+    return {
+        "labels": [d.strftime("%b %d") for d in days],
+        "portal": [round(buckets[d]["portal"], 2) for d in days],
+        "bot": [round(buckets[d]["bot"], 2) for d in days],
+        "missed": [round(buckets[d]["missed"], 2) for d in days],
     }

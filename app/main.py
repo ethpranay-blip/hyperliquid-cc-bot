@@ -52,6 +52,8 @@ from app.performance import (
     summarize as _perf_summarize,
     cumulative_series as _perf_cumulative,
     aggregate_portal_trades as _perf_aggregate_portal,
+    window_summary as _perf_windows,
+    weekly_pnl as _perf_weekly,
     STATUS_COPIED_CLOSED, STATUS_MISSED, STATUS_COPIED_OPEN,
     STATUS_COPIED_ORPHAN, STATUS_BOT_ONLY,
 )
@@ -2132,14 +2134,23 @@ async def performance_page() -> None:
         return
     ui.add_head_html(
         "<style>"
-        ".perf-metric { background: #1a202c; color: #e2e8f0; padding: 14px 18px; "
-        "  border-radius: 10px; min-width: 180px; }"
-        ".perf-metric .label { font-size: 11px; opacity: 0.65; text-transform: uppercase; }"
-        ".perf-metric .value { font-size: 24px; font-weight: 700; margin-top: 4px; }"
-        ".perf-metric .sub { font-size: 11px; opacity: 0.6; margin-top: 2px; }"
+        ".perf-metric { background: linear-gradient(145deg, #1e2735, #171e2b); "
+        "  color: #e2e8f0; padding: 16px 20px; border-radius: 16px; "
+        "  min-width: 200px; border: 1px solid #2d3a4f; "
+        "  box-shadow: 0 4px 14px rgba(0,0,0,0.35); }"
+        ".perf-metric .label { font-size: 11px; opacity: 0.65; text-transform: uppercase; "
+        "  letter-spacing: 0.06em; }"
+        ".perf-metric .value { font-size: 26px; font-weight: 800; margin-top: 4px; }"
+        ".perf-metric .sub { font-size: 11px; opacity: 0.6; margin-top: 3px; }"
         ".perf-pos { color: #48bb78; }   .perf-neg { color: #fc8181; }"
         ".perf-caveat { background: #44391a; color: #faf0c6; padding: 12px 16px; "
-        "  border-radius: 8px; font-size: 12px; line-height: 1.5; }"
+        "  border-radius: 12px; font-size: 12px; line-height: 1.5; }"
+        ".perf-pain { background: linear-gradient(145deg, #3b2b12, #2e2110); "
+        "  color: #fbd38d; padding: 14px 18px; border-radius: 14px; "
+        "  border: 1px solid #975a16; font-size: 13px; line-height: 1.6; "
+        "  margin-top: 10px; }"
+        ".perf-verdict { border-radius: 14px; overflow: hidden; }"
+        ".perf-verdict .q-table th { font-weight: 700; letter-spacing: 0.04em; }"
         "</style>"
     )
 
@@ -2227,6 +2238,13 @@ async def performance_page() -> None:
         curves = _perf_cumulative(
             reconciled, per_trade_margin_usd=per_trade_margin,
         )
+        verdict = _perf_windows(
+            reconciled, per_trade_margin_usd=per_trade_margin,
+            now_ms=int(time.time() * 1000),
+        )
+        weeks = _perf_weekly(
+            reconciled, per_trade_margin_usd=per_trade_margin,
+        )
     except Exception as exc:
         container.clear()
         with container:
@@ -2256,27 +2274,78 @@ async def performance_page() -> None:
                 ui.label(subtitle).classes("sub")
 
     with container:
-        # Caveats
-        with ui.element("div").classes("perf-caveat w-full"):
-            ui.html(
-                "<strong>How to read this:</strong> Bot data is from your live SQLite "
-                "(<code>hl_closed_trades</code> minus pre-seeded). Portal data is from "
-                "the current activity feed window — older closes may have rolled off. "
-                "<strong>Portal hypothetical $</strong> = "
-                f"<code>${per_trade_margin:.0f} × pnl%</code> per trade (perp ROI on "
-                "margin). <strong>Bot actual $</strong> is realized PnL after fees on HL. "
-                "Only <em>closed</em> trades count for performance; open positions aren't "
-                "included (no unrealized PnL shown)."
-            )
-
         taken = summary["taken"]
         missed = summary["missed"]
+        status_counts = summary["status_counts"]
 
         def _usd_or_dash(v, fmt="${:,.2f}"):
             return fmt.format(v) if v is not None else "—"
 
-        # ═══════════ HERO — the numbers that answer "is the bot working" ═══════════
-        ui.label("At a glance").classes("text-lg font-bold")
+        _reason_labels = {
+            "stale": "🕰️ Stale (bot restart)",
+            "blocked_coin_live": "🚫 Coin already live",
+            "insufficient_margin": "💸 Insufficient margin",
+            "entry_slipped": "🎯 Entry slipped",
+            "ticker_not_found": "❓ Not on HL",
+            "resting_expired": "⌛ Resting expired",
+            "resting_cancelled": "🕒 Resting cancelled",
+            "unknown": "⚠️ Unrecorded (pre-tracking)",
+        }
+        _reason_fixes = {
+            "insufficient_margin": "free up USDC or switch to Fixed-Risk sizing so each trade uses less margin",
+            "entry_slipped": "price ran before we acted — resting entries now catch retraces; consider a longer RESTING_ENTRY_TTL_MINUTES or slightly wider entry cap",
+            "ticker_not_found": "these instruments aren't listed on Hyperliquid (or need a reviewed alias) — structural, not fixable by tuning",
+            "stale": "trades posted while the bot was restarting — avoid redeploys during active hours",
+            "resting_expired": "price never returned to the caller's entry — an honest miss, not a bug",
+            "blocked_coin_live": "one-position-per-coin guard — by design",
+            "resting_cancelled": "caller closed before our resting entry filled — an honest miss",
+            "unknown": "skipped before skip-tracking existed — no action possible",
+        }
+
+        # ══════════════ 1 · THE VERDICT ══════════════
+        ui.label("📊 The verdict").classes("text-lg font-bold")
+        ui.label(
+            "Same yardstick everywhere: every portal call priced at "
+            f"${per_trade_margin:.0f} margin per trade. “If nothing missed” = "
+            "bot’s real PnL + what its skipped trades would have done."
+        ).classes("text-xs opacity-60")
+        _v_cols = [
+            {"name": "label", "label": "Window", "field": "label"},
+            {"name": "portal", "label": "Callers’ calls", "field": "portal"},
+            {"name": "bot", "label": "Bot (actual)", "field": "bot"},
+            {"name": "combined", "label": "Bot if nothing missed", "field": "combined"},
+        ]
+        _v_rows = [
+            {
+                "label": w["label"],
+                "portal": f"{_signed(w['portal_usd'])}  ({w['portal_n']} closed)",
+                "bot": f"{_signed(w['bot_usd'])}  ({w['bot_n']} closed)",
+                "combined": _signed(w["combined_usd"]),
+            }
+            for w in verdict
+        ]
+        ui.table(columns=_v_cols, rows=_v_rows, row_key="label").classes(
+            "w-full perf-verdict"
+        ).props("flat bordered dense")
+
+        # Pain point — the single guard costing the most real profit.
+        _painful = [
+            s for s in missed["by_reason"]
+            if s["cost_usd"] > 0 and s["reason"] != "unknown"
+        ]
+        if _painful:
+            pain = max(_painful, key=lambda s: s["cost_usd"])
+            with ui.element("div").classes("perf-pain w-full"):
+                ui.html(
+                    f"<b>😤 Biggest pain point right now: "
+                    f"{_reason_labels.get(pain['reason'], pain['reason'])}</b> — "
+                    f"cost you <b>${pain['cost_usd']:,.2f}</b> of missed profit "
+                    f"across {pain['count']} skips.<br>"
+                    f"<b>What to do:</b> {_reason_fixes.get(pain['reason'], 'review these skips in the table below')}."
+                )
+
+        # ══════════════ 2 · AT A GLANCE ══════════════
+        ui.label("At a glance").classes("text-lg font-bold mt-4")
         with ui.row().classes("gap-3 flex-wrap"):
             _metric(
                 "Bot realized PnL",
@@ -2297,81 +2366,168 @@ async def performance_page() -> None:
                 f"avg position size {_usd_or_dash(taken['avg_notional_usd'])} notional",
             )
             _metric(
-                "Missed trades cost",
-                _signed(missed["portal_usd"]),
-                f"{missed['count']} missed · {missed['completed']} with known outcome "
-                f"(at ${per_trade_margin:.0f}/trade)",
-                # positive missed $ = money left on the table = BAD → red
-                "perf-neg" if (missed["portal_usd"] or 0) > 0 else "perf-pos",
+                "Missed winners cost us",
+                f"${missed['winners_cost_usd']:,.2f}",
+                "profit left on the table — the number to shrink",
+                "perf-neg",
+            )
+            _metric(
+                "Skips dodged losers worth",
+                f"${missed['losers_saved_usd']:,.2f}",
+                "losses we avoided by NOT taking those calls",
+                "perf-pos",
             )
 
-        # ═══════════ MISSED TRADES — what each skip reason cost ═══════════
+        # ══════════════ 3 · WHERE EVERY CALL WENT (flow) ══════════════
+        _taken_n = (
+            status_counts.get(STATUS_COPIED_CLOSED, 0)
+            + status_counts.get(STATUS_COPIED_OPEN, 0)
+            + status_counts.get(STATUS_COPIED_ORPHAN, 0)
+        )
+        _missed_n = status_counts.get(STATUS_MISSED, 0)
+        _botonly_n = status_counts.get(STATUS_BOT_ONLY, 0)
+        _all_n = _taken_n + _missed_n + _botonly_n
+        if _all_n:
+            ui.label("Where every call went").classes("text-lg font-bold mt-4")
+            ui.label(
+                f"All {_all_n} calls in view → taken vs missed, and WHY the "
+                "missed ones were skipped."
+            ).classes("text-xs opacity-60")
+            _sk_nodes = [
+                {"name": f"All calls ({_all_n})",
+                 "itemStyle": {"color": "#63b3ed"}},
+                {"name": f"✅ Taken ({_taken_n})",
+                 "itemStyle": {"color": "#48bb78"}},
+                {"name": f"❌ Missed ({_missed_n})",
+                 "itemStyle": {"color": "#fc8181"}},
+            ]
+            _sk_links = [
+                {"source": f"All calls ({_all_n})",
+                 "target": f"✅ Taken ({_taken_n})", "value": _taken_n},
+                {"source": f"All calls ({_all_n})",
+                 "target": f"❌ Missed ({_missed_n})", "value": _missed_n},
+            ]
+            if _botonly_n:
+                _sk_nodes.append({"name": f"📼 Rolled off feed ({_botonly_n})",
+                                  "itemStyle": {"color": "#a0aec0"}})
+                _sk_links.append({
+                    "source": f"All calls ({_all_n})",
+                    "target": f"📼 Rolled off feed ({_botonly_n})",
+                    "value": _botonly_n,
+                })
+            for s in missed["by_reason"]:
+                lbl = f"{_reason_labels.get(s['reason'], s['reason'])} ({s['count']})"
+                _sk_nodes.append({"name": lbl,
+                                  "itemStyle": {"color": "#f6ad55"}})
+                _sk_links.append({
+                    "source": f"❌ Missed ({_missed_n})",
+                    "target": lbl, "value": s["count"],
+                })
+            try:
+                ui.echart({
+                    "backgroundColor": "transparent",
+                    "tooltip": {"trigger": "item"},
+                    "series": [{
+                        "type": "sankey",
+                        "data": _sk_nodes,
+                        "links": _sk_links,
+                        "left": 10, "right": 240, "top": 10, "bottom": 10,
+                        "nodeWidth": 18, "nodeGap": 12,
+                        "label": {"color": "#e2e8f0", "fontSize": 13},
+                        "lineStyle": {"color": "gradient", "curveness": 0.5,
+                                      "opacity": 0.35},
+                    }],
+                }).classes("w-full").style("height: 380px;")
+            except Exception:
+                log.debug("sankey unavailable — pie fallback", exc_info=True)
+                ui.echart({
+                    "backgroundColor": "transparent",
+                    "tooltip": {"trigger": "item",
+                                "formatter": "{b}: {c} ({d}%)"},
+                    "series": [{
+                        "type": "pie", "radius": ["40%", "70%"],
+                        "label": {"color": "#e2e8f0", "formatter": "{b}\n{c}"},
+                        "data": [
+                            {"name": "✅ Taken", "value": _taken_n,
+                             "itemStyle": {"color": "#48bb78"}},
+                            {"name": "❌ Missed", "value": _missed_n,
+                             "itemStyle": {"color": "#fc8181"}},
+                            {"name": "📼 Rolled off", "value": _botonly_n,
+                             "itemStyle": {"color": "#a0aec0"}},
+                        ],
+                    }],
+                }).classes("w-full").style("height: 300px;")
+
+        # ══════════════ 4 · MISSED: COST vs SAVED ══════════════
         if missed["by_reason"]:
-            ui.label("What missed trades cost — by skip reason").classes(
-                "text-base font-semibold mt-2"
+            ui.label("Missed trades — cost us vs saved us, by reason").classes(
+                "text-lg font-bold mt-4"
             )
             ui.label(
-                "Portal outcome of every trade the bot did NOT take, priced at "
-                f"${per_trade_margin:.0f}/trade. Positive bar = money left on the "
-                "table by that skip reason; negative = those skips dodged losers. "
-                "This is the chart that says which guard to tune."
+                "Both bars are positive $ — no sign-flipping to decode. "
+                "RED (right) = profit those skips cost us. GREEN (left) = "
+                "losses those skips saved us from. A reason can have both."
             ).classes("text-xs opacity-60")
-            _reason_labels = {
-                "stale": "🕰️ Stale (bot restart)",
-                "blocked_coin_live": "🚫 Coin already live",
-                "insufficient_margin": "💸 Insufficient margin",
-                "entry_slipped": "🎯 Entry slipped",
-                "ticker_not_found": "❓ Not on HL",
-                "resting_expired": "⌛ Resting expired",
-                "resting_cancelled": "🕒 Resting cancelled",
-                "unknown": "⚠️ Unrecorded (pre-tracking)",
-            }
-            _rows = summary["missed"]["by_reason"]
+            _rows = missed["by_reason"]
+            _cats = [
+                f"{_reason_labels.get(s['reason'], s['reason'])} ({s['count']}×)"
+                for s in reversed(_rows)
+            ]
             try:
                 ui.echart({
                     "backgroundColor": "transparent",
                     "tooltip": {"trigger": "axis",
                                 "axisPointer": {"type": "shadow"}},
-                    "grid": {"left": 220, "right": 80, "top": 10, "bottom": 30},
+                    "legend": {"data": ["Saved us $", "Cost us $"],
+                               "textStyle": {"color": "#e2e8f0"}, "top": 0},
+                    "grid": {"left": 250, "right": 90, "top": 34, "bottom": 30},
                     "xAxis": {
                         "type": "value",
-                        "axisLabel": {"color": "#a0aec0", "formatter": "${value}"},
+                        "axisLabel": {"color": "#a0aec0",
+                                      "formatter": "${value}"},
                         "splitLine": {"lineStyle": {"color": "#2d3748"}},
                     },
                     "yAxis": {
-                        "type": "category",
-                        "data": [
-                            f"{_reason_labels.get(s['reason'], s['reason'])}  "
-                            f"({s['count']}×)"
-                            for s in reversed(_rows)
-                        ],
+                        "type": "category", "data": _cats,
                         "axisLabel": {"color": "#e2e8f0", "fontSize": 13},
                     },
-                    "series": [{
-                        "type": "bar", "barMaxWidth": 30,
-                        "label": {"show": True, "position": "right",
-                                  "color": "#e2e8f0", "formatter": "${c}"},
-                        "data": [
-                            {
-                                "value": round(s["portal_usd"], 2),
-                                "itemStyle": {
-                                    "color": "#fc8181" if s["portal_usd"] > 0
-                                    else "#48bb78",
-                                    "borderRadius": 4,
-                                },
-                            }
-                            for s in reversed(_rows)
-                        ],
-                    }],
+                    "series": [
+                        {
+                            "name": "Saved us $", "type": "bar", "stack": "s",
+                            "barMaxWidth": 26,
+                            "itemStyle": {"color": "#48bb78",
+                                          "borderRadius": [4, 0, 0, 4]},
+                            "label": {"show": True, "position": "left",
+                                      "color": "#9ae6b4",
+                                      "formatter": "${c}"},
+                            "data": [
+                                -round(s["saved_usd"], 2)
+                                for s in reversed(_rows)
+                            ],
+                        },
+                        {
+                            "name": "Cost us $", "type": "bar", "stack": "s",
+                            "barMaxWidth": 26,
+                            "itemStyle": {"color": "#fc8181",
+                                          "borderRadius": [0, 4, 4, 0]},
+                            "label": {"show": True, "position": "right",
+                                      "color": "#feb2b2",
+                                      "formatter": "${c}"},
+                            "data": [
+                                round(s["cost_usd"], 2)
+                                for s in reversed(_rows)
+                            ],
+                        },
+                    ],
                 }).classes("w-full").style(
-                    f"height: {max(160, 60 * len(_rows) + 60)}px;"
+                    f"height: {max(180, 56 * len(_rows) + 70)}px;"
                 )
             except Exception:
-                log.debug("ui.echart unavailable for missed-by-reason", exc_info=True)
+                log.debug("cost/saved chart unavailable", exc_info=True)
                 for s in _rows:
                     ui.label(
                         f"{_reason_labels.get(s['reason'], s['reason'])}: "
-                        f"{s['count']}× → {_signed(s['portal_usd'])}"
+                        f"cost ${s['cost_usd']:,.2f} · saved ${s['saved_usd']:,.2f}"
                     ).classes("text-sm")
             if missed["biggest_missed"]:
                 bm = missed["biggest_missed"]
@@ -2382,199 +2538,56 @@ async def performance_page() -> None:
                     f"{_reason_labels.get(bm['reason'], bm['reason'])}"
                 ).classes("text-sm perf-caveat w-full")
 
-        # Headline: direct apples-to-apples comparison
-        ui.label("Direct comparison — trades present on both sides").classes("text-base font-semibold mt-2")
-        if summary["direct_count"] == 0:
+        # ══════════════ 5 · WEEK BY WEEK (bars, not lines) ══════════════
+        if weeks["labels"]:
+            ui.label("Week by week").classes("text-lg font-bold mt-4")
             ui.label(
-                "No trades currently match on both sides. Your bot's closed "
-                "trades and the portal's recent closes don't overlap yet — the "
-                "portal feed is a rolling window, but portal outcomes are now "
-                "persisted, so matches will populate as new trades close on both "
-                "sides. The 'Wider totals' below are the accurate per-side numbers."
-            ).classes("text-sm opacity-70 perf-caveat w-full")
-        with ui.row().classes("gap-3 flex-wrap"):
-            _metric(
-                "Portal hypothetical",
-                _signed(summary["direct_portal_usd"]),
-                f"{summary['direct_count']} matched trades",
-                _signed_cls(summary["direct_portal_usd"]),
-            )
-            _metric(
-                "Bot actual",
-                _signed(summary["direct_bot_usd"]),
-                "after fees",
-                _signed_cls(summary["direct_bot_usd"]),
-            )
-            _metric(
-                "Difference (bot − portal)",
-                _signed(summary["direct_diff_usd"]),
-                "negative = bot underperformed",
-                _signed_cls(summary["direct_diff_usd"]),
-            )
-
-        # Cumulative PnL curves — the headline "are we tracking the callers" visual
-        if curves["portal"] or curves["bot"]:
-            ui.label("Cumulative PnL over time").classes("text-base font-semibold mt-2")
-            ui.label(
-                "Each curve sums its own closed trades in time order. Portal uses "
-                f"${per_trade_margin:.0f} × pnl% at the portal close time; bot uses "
-                "realized PnL at the bot close time. Flat stretches = no closes."
+                "Weekly PnL, same $-per-trade yardstick. Blue = all callers’ "
+                "calls · orange = bot actual · red = what the missed ones did."
             ).classes("text-xs opacity-60")
             try:
                 ui.echart({
                     "backgroundColor": "transparent",
-                    "tooltip": {
-                        "trigger": "axis",
-                        "axisPointer": {"type": "cross"},
-                    },
-                    "legend": {
-                        "data": ["Portal hypothetical $", "Bot actual $",
-                                 "Missed trades (cost) $"],
-                        "textStyle": {"color": "#e2e8f0"},
-                        "top": 4,
-                    },
-                    "grid": {"left": 70, "right": 30, "top": 44, "bottom": 48},
+                    "tooltip": {"trigger": "axis",
+                                "axisPointer": {"type": "shadow"}},
+                    "legend": {"data": ["Callers’ calls", "Bot actual",
+                                        "Missed trades"],
+                               "textStyle": {"color": "#e2e8f0"}, "top": 0},
+                    "grid": {"left": 70, "right": 30, "top": 36, "bottom": 36},
                     "xAxis": {
-                        "type": "time",
-                        "axisLabel": {"color": "#a0aec0"},
+                        "type": "category", "data": weeks["labels"],
+                        "axisLabel": {"color": "#e2e8f0"},
                         "axisLine": {"lineStyle": {"color": "#4a5568"}},
-                        "splitLine": {"show": False},
                     },
                     "yAxis": {
                         "type": "value",
-                        "axisLabel": {"color": "#a0aec0", "formatter": "${value}"},
+                        "axisLabel": {"color": "#a0aec0",
+                                      "formatter": "${value}"},
                         "splitLine": {"lineStyle": {"color": "#2d3748"}},
                     },
                     "series": [
-                        {
-                            "name": "Portal hypothetical $", "type": "line",
-                            "step": "end", "showSymbol": True, "symbolSize": 6,
-                            "lineStyle": {"width": 2.5, "color": "#63b3ed"},
-                            "itemStyle": {"color": "#63b3ed"},
-                            "areaStyle": {"opacity": 0.08, "color": "#63b3ed"},
-                            "data": curves["portal"],
-                        },
-                        {
-                            "name": "Bot actual $", "type": "line",
-                            "step": "end", "showSymbol": True, "symbolSize": 6,
-                            "lineStyle": {"width": 2.5, "color": "#f6ad55"},
-                            "itemStyle": {"color": "#f6ad55"},
-                            "areaStyle": {"opacity": 0.08, "color": "#f6ad55"},
-                            "data": curves["bot"],
-                        },
-                        {
-                            "name": "Missed trades (cost) $", "type": "line",
-                            "step": "end", "showSymbol": True, "symbolSize": 5,
-                            "lineStyle": {"width": 2, "color": "#fc8181",
-                                          "type": "dashed"},
-                            "itemStyle": {"color": "#fc8181"},
-                            "data": curves.get("missed", []),
-                        },
+                        {"name": "Callers’ calls", "type": "bar",
+                         "barMaxWidth": 26,
+                         "itemStyle": {"color": "#63b3ed",
+                                       "borderRadius": [4, 4, 0, 0]},
+                         "data": weeks["portal"]},
+                        {"name": "Bot actual", "type": "bar",
+                         "barMaxWidth": 26,
+                         "itemStyle": {"color": "#f6ad55",
+                                       "borderRadius": [4, 4, 0, 0]},
+                         "data": weeks["bot"]},
+                        {"name": "Missed trades", "type": "bar",
+                         "barMaxWidth": 26,
+                         "itemStyle": {"color": "#fc8181",
+                                       "borderRadius": [4, 4, 0, 0]},
+                         "data": weeks["missed"]},
                     ],
-                }).classes("w-full").style("height: 360px;")
+                }).classes("w-full").style("height: 320px;")
             except Exception:
-                log.debug("ui.echart unavailable for cumulative curve", exc_info=True)
-                ui.label(
-                    "Chart unavailable in this NiceGUI version — totals above still apply."
-                ).classes("text-xs opacity-60")
+                log.debug("weekly bars unavailable", exc_info=True)
 
-        # Wider totals
-        ui.label("Wider totals — full window each side").classes("text-base font-semibold mt-2")
-        with ui.row().classes("gap-3 flex-wrap"):
-            _metric(
-                f"Portal — {summary['portal_completed_count']} completed",
-                _signed(summary["portal_total_usd"]),
-                f"win rate {summary['portal_win_rate']*100:.0f}%",
-                _signed_cls(summary["portal_total_usd"]),
-            )
-            _metric(
-                f"Bot — {summary['bot_closed_count']} closed",
-                _signed(summary["bot_total_usd"]),
-                f"fees ${summary['bot_fees_usd']:.2f} · win rate {summary['bot_win_rate']*100:.0f}%",
-                _signed_cls(summary["bot_total_usd"]),
-            )
-
-        # Status breakdown
-        ui.label("Trade status breakdown").classes("text-base font-semibold mt-2")
-        with ui.row().classes("gap-3 flex-wrap"):
-            labels = {
-                STATUS_COPIED_CLOSED: "Copied + closed",
-                STATUS_COPIED_OPEN: "Copied (still open)",
-                STATUS_COPIED_ORPHAN: "Copied (orphan)",
-                STATUS_MISSED: "Missed (portal had it, bot didn't)",
-                STATUS_BOT_ONLY: "Bot-only (portal feed rolled off)",
-            }
-            for status, label in labels.items():
-                count = summary["status_counts"].get(status, 0)
-                if count == 0:
-                    continue
-                with ui.element("div").classes("perf-metric"):
-                    ui.label(label).classes("label")
-                    ui.html(f'<div class="value">{count}</div>')
-
-        # Skip-reason breakdown (persisted — survives log rotation)
-        try:
-            skip_counts = db.get_skip_reason_counts()
-        except Exception:
-            skip_counts = {}
-        if skip_counts:
-            ui.label("Why signals were skipped (persisted)").classes("text-base font-semibold mt-2")
-            ui.label(
-                "Recorded at skip time, so this survives log rotation. "
-                "ticker_not_found = caller's symbol isn't on HL (or needs an alias)."
-            ).classes("text-xs opacity-60")
-            _skip_labels = {
-                "stale": "🕰️ Stale (pre-startup)",
-                "blocked_coin_live": "🚫 Blocked (coin already live)",
-                "insufficient_margin": "💸 Insufficient margin",
-                "entry_slipped": "🎯 Entry slipped (>cap)",
-                "ticker_not_found": "❓ Ticker not on HL",
-            }
-            _skip_colors = {
-                "stale": "#ed8936",
-                "blocked_coin_live": "#ecc94b",
-                "insufficient_margin": "#fc8181",
-                "entry_slipped": "#9f7aea",
-                "ticker_not_found": "#63b3ed",
-            }
-            _sorted_skips = sorted(skip_counts.items(), key=lambda x: -x[1])
-            with ui.row().classes("w-full items-center gap-4 flex-wrap"):
-                try:
-                    ui.echart({
-                        "backgroundColor": "transparent",
-                        "tooltip": {"trigger": "item",
-                                    "formatter": "{b}: {c} ({d}%)"},
-                        "series": [{
-                            "type": "pie",
-                            "radius": ["45%", "75%"],
-                            "avoidLabelOverlap": True,
-                            "itemStyle": {"borderRadius": 6,
-                                          "borderColor": "#1a202c",
-                                          "borderWidth": 2},
-                            "label": {"color": "#e2e8f0",
-                                      "formatter": "{b}\n{c}"},
-                            "data": [
-                                {
-                                    "name": _skip_labels.get(r, r),
-                                    "value": n,
-                                    "itemStyle": {
-                                        "color": _skip_colors.get(r, "#a0aec0"),
-                                    },
-                                }
-                                for r, n in _sorted_skips
-                            ],
-                        }],
-                    }).classes("flex-grow").style("height: 280px; min-width: 380px;")
-                except Exception:
-                    log.debug("ui.echart unavailable for skip donut", exc_info=True)
-                with ui.column().classes("gap-2"):
-                    for reason, count in _sorted_skips:
-                        with ui.element("div").classes("perf-metric"):
-                            ui.label(_skip_labels.get(reason, reason)).classes("label")
-                            ui.html(f'<div class="value">{count}</div>')
-
-        # Per-caller chart
-        ui.label("Performance by caller").classes("text-base font-semibold mt-2")
+        # ══════════════ 6 · PER-CALLER ══════════════
+        ui.label("Performance by caller").classes("text-lg font-bold mt-4")
         callers = summary["by_caller"]
         if callers:
             try:
@@ -2582,7 +2595,7 @@ async def performance_page() -> None:
                     "backgroundColor": "transparent",
                     "tooltip": {"trigger": "axis",
                                 "axisPointer": {"type": "shadow"}},
-                    "legend": {"data": ["Portal hypothetical $", "Bot actual $"],
+                    "legend": {"data": ["Callers’ calls $", "Bot actual $"],
                                "textStyle": {"color": "#e2e8f0"}, "top": 4},
                     "grid": {"left": 70, "right": 30, "top": 44, "bottom": 36},
                     "xAxis": {
@@ -2593,102 +2606,158 @@ async def performance_page() -> None:
                     },
                     "yAxis": {
                         "type": "value",
-                        "axisLabel": {"color": "#a0aec0", "formatter": "${value}"},
+                        "axisLabel": {"color": "#a0aec0",
+                                      "formatter": "${value}"},
                         "splitLine": {"lineStyle": {"color": "#2d3748"}},
                     },
                     "series": [
-                        {"name": "Portal hypothetical $", "type": "bar",
+                        {"name": "Callers’ calls $", "type": "bar",
                          "barMaxWidth": 56,
                          "itemStyle": {"color": "#63b3ed",
                                        "borderRadius": [6, 6, 0, 0]},
                          "label": {"show": True, "position": "top",
-                                   "color": "#e2e8f0",
-                                   "formatter": "${c}"},
-                         "data": [round(c["portal_pnl_usd"], 2) for c in callers]},
+                                   "color": "#e2e8f0", "formatter": "${c}"},
+                         "data": [round(c["portal_pnl_usd"], 2)
+                                  for c in callers]},
                         {"name": "Bot actual $", "type": "bar",
                          "barMaxWidth": 56,
                          "itemStyle": {"color": "#f6ad55",
                                        "borderRadius": [6, 6, 0, 0]},
                          "label": {"show": True, "position": "top",
-                                   "color": "#e2e8f0",
-                                   "formatter": "${c}"},
-                         "data": [round(c["bot_pnl_usd"], 2) for c in callers]},
+                                   "color": "#e2e8f0", "formatter": "${c}"},
+                         "data": [round(c["bot_pnl_usd"], 2)
+                                  for c in callers]},
                     ],
-                }).classes("w-full").style("height: 340px;")
+                }).classes("w-full").style("height: 320px;")
             except Exception:
-                # ui.echart may not be available in older NiceGUI — fall back to
-                # a simple table so the page still renders.
-                log.debug("ui.echart unavailable, using table fallback", exc_info=True)
-                _caller_rows = [{
-                    "caller": c["caller"],
-                    "portal_pnl": _signed(c["portal_pnl_usd"]),
-                    "bot_pnl": _signed(c["bot_pnl_usd"]),
-                    "completed": c["portal_completed"],
-                    "missed": c["bot_missed"],
-                } for c in callers]
-                ui.table(
-                    columns=[
-                        {"name": "caller", "label": "Caller", "field": "caller"},
-                        {"name": "portal_pnl", "label": "Portal $", "field": "portal_pnl"},
-                        {"name": "bot_pnl", "label": "Bot $", "field": "bot_pnl"},
-                        {"name": "completed", "label": "Portal completed", "field": "completed"},
-                        {"name": "missed", "label": "Bot missed", "field": "missed"},
-                    ],
-                    rows=_caller_rows, row_key="caller",
-                ).classes("w-full")
+                log.debug("caller chart unavailable", exc_info=True)
 
-        # Per-trade table — capped so the WebSocket state-sync stays small.
-        ui.label("Trade-level reconciliation").classes("text-base font-semibold mt-2")
-        ui.label(
-            f"Newest first, most recent {PERF_TABLE_ROWS}. Negative bot $ = realized loss."
-        ).classes("text-xs opacity-60")
-        trade_rows = []
-        for r in reconciled[:PERF_TABLE_ROWS]:
-            trade_rows.append({
-                "trade_id": r.trade_id,
-                "coin": r.coin,
-                "side": (r.side or "").upper(),
-                "caller": r.caller or "—",
-                "status": r.bot_status,
-                "portal_pnl_pct": (
-                    f"{r.portal_pnl_pct*100:+.2f}%" if r.portal_pnl_pct is not None else "—"
-                ),
-                "portal_pnl_usd": (
-                    _signed(r.portal_pnl_pct * per_trade_margin)
-                    if r.portal_pnl_pct is not None else "—"
-                ),
-                "bot_pnl_usd": _signed(r.bot_pnl_usd) if r.bot_pnl_usd is not None else "—",
-                "bot_margin": (
-                    f"${r.bot_margin_usd:,.0f}" if r.bot_margin_usd else "—"
-                ),
-                "bot_notional": (
-                    f"${r.bot_notional_usd:,.0f}" if r.bot_notional_usd else "—"
-                ),
-                "bot_fee_usd": (
-                    f"${r.bot_fee_usd:.2f}" if r.bot_fee_usd is not None else "—"
-                ),
-                "skip_reason": r.skip_reason or (
-                    "—" if r.bot_status != STATUS_MISSED else "unrecorded"
-                ),
-            })
-        ui.table(
-            columns=[
-                {"name": "trade_id", "label": "ID", "field": "trade_id", "sortable": True},
-                {"name": "coin", "label": "Coin", "field": "coin", "sortable": True},
-                {"name": "side", "label": "Side", "field": "side"},
-                {"name": "caller", "label": "Caller", "field": "caller", "sortable": True},
-                {"name": "status", "label": "Status", "field": "status", "sortable": True},
-                {"name": "skip_reason", "label": "Skip reason", "field": "skip_reason", "sortable": True},
-                {"name": "portal_pnl_pct", "label": "Portal %", "field": "portal_pnl_pct"},
-                {"name": "portal_pnl_usd", "label": "Portal $", "field": "portal_pnl_usd"},
-                {"name": "bot_pnl_usd", "label": "Bot $", "field": "bot_pnl_usd"},
-                {"name": "bot_margin", "label": "Margin", "field": "bot_margin"},
-                {"name": "bot_notional", "label": "Size $", "field": "bot_notional"},
-                {"name": "bot_fee_usd", "label": "Fee", "field": "bot_fee_usd"},
-            ],
-            rows=trade_rows, row_key="trade_id",
-            pagination={"rowsPerPage": 50},
-        ).classes("w-full")
+        # ══════════════ 7 · ADVANCED (tucked away) ══════════════
+        with ui.expansion("📈 Advanced — matched-trade comparison & cumulative curves").classes("w-full mt-4"):
+            ui.label(
+                "Direct comparison uses ONLY the trades both sides completed "
+                f"({summary['direct_count']} matched) — a different population "
+                "from the wider totals, which is why the numbers differ."
+            ).classes("text-xs opacity-60")
+            with ui.row().classes("gap-3 flex-wrap"):
+                _metric("Portal (matched only)",
+                        _signed(summary["direct_portal_usd"]),
+                        f"{summary['direct_count']} matched trades",
+                        _signed_cls(summary["direct_portal_usd"]))
+                _metric("Bot (matched only)",
+                        _signed(summary["direct_bot_usd"]), "after fees",
+                        _signed_cls(summary["direct_bot_usd"]))
+                _metric("Gap (bot − portal)",
+                        _signed(summary["direct_diff_usd"]),
+                        "negative = bot underperformed on shared trades",
+                        _signed_cls(summary["direct_diff_usd"]))
+                _metric(
+                    f"ALL portal calls ({summary['portal_completed_count']})",
+                    _signed(summary["portal_total_usd"]),
+                    f"win rate {summary['portal_win_rate']*100:.0f}% — every "
+                    f"completed call at ${per_trade_margin:.0f}/trade",
+                    _signed_cls(summary["portal_total_usd"]),
+                )
+            if curves["portal"] or curves["bot"]:
+                try:
+                    ui.echart({
+                        "backgroundColor": "transparent",
+                        "tooltip": {"trigger": "axis",
+                                    "axisPointer": {"type": "cross"}},
+                        "legend": {"data": ["Portal hypothetical $",
+                                            "Bot actual $",
+                                            "Missed trades $"],
+                                   "textStyle": {"color": "#e2e8f0"},
+                                   "top": 4},
+                        "grid": {"left": 70, "right": 30, "top": 44,
+                                 "bottom": 48},
+                        "xAxis": {"type": "time",
+                                  "axisLabel": {"color": "#a0aec0"},
+                                  "splitLine": {"show": False}},
+                        "yAxis": {"type": "value",
+                                  "axisLabel": {"color": "#a0aec0",
+                                                "formatter": "${value}"},
+                                  "splitLine": {"lineStyle":
+                                                {"color": "#2d3748"}}},
+                        "series": [
+                            {"name": "Portal hypothetical $", "type": "line",
+                             "step": "end", "showSymbol": False,
+                             "lineStyle": {"width": 2, "color": "#63b3ed"},
+                             "itemStyle": {"color": "#63b3ed"},
+                             "data": curves["portal"]},
+                            {"name": "Bot actual $", "type": "line",
+                             "step": "end", "showSymbol": False,
+                             "lineStyle": {"width": 2, "color": "#f6ad55"},
+                             "itemStyle": {"color": "#f6ad55"},
+                             "data": curves["bot"]},
+                            {"name": "Missed trades $", "type": "line",
+                             "step": "end", "showSymbol": False,
+                             "lineStyle": {"width": 2, "color": "#fc8181",
+                                           "type": "dashed"},
+                             "itemStyle": {"color": "#fc8181"},
+                             "data": curves.get("missed", [])},
+                        ],
+                    }).classes("w-full").style("height: 320px;")
+                except Exception:
+                    log.debug("cumulative chart unavailable", exc_info=True)
+
+        # ══════════════ 8 · EVERY TRADE (tucked away) ══════════════
+        with ui.expansion(
+            f"🧾 Every trade, reconciled ({len(reconciled)} rows)"
+        ).classes("w-full mt-2"):
+            trade_rows = []
+            for r in reconciled:
+                trade_rows.append({
+                    "trade_id": r.trade_id,
+                    "coin": r.coin,
+                    "side": (r.side or "").upper(),
+                    "caller": r.caller or "—",
+                    "status": r.bot_status,
+                    "skip_reason": r.skip_reason or (
+                        "—" if r.bot_status != STATUS_MISSED else "unrecorded"
+                    ),
+                    "portal_pnl_pct": (
+                        f"{r.portal_pnl_pct*100:+.2f}%"
+                        if r.portal_pnl_pct is not None else "—"
+                    ),
+                    "portal_pnl_usd": (
+                        _signed(r.portal_pnl_pct * per_trade_margin)
+                        if r.portal_pnl_pct is not None else "—"
+                    ),
+                    "bot_pnl_usd": (
+                        _signed(r.bot_pnl_usd)
+                        if r.bot_pnl_usd is not None else "—"
+                    ),
+                    "bot_margin": (
+                        f"${r.bot_margin_usd:,.0f}" if r.bot_margin_usd else "—"
+                    ),
+                    "bot_notional": (
+                        f"${r.bot_notional_usd:,.0f}"
+                        if r.bot_notional_usd else "—"
+                    ),
+                    "bot_fee_usd": (
+                        f"${r.bot_fee_usd:.2f}"
+                        if r.bot_fee_usd is not None else "—"
+                    ),
+                })
+            ui.table(
+                columns=[
+                    {"name": "trade_id", "label": "ID", "field": "trade_id", "sortable": True},
+                    {"name": "coin", "label": "Coin", "field": "coin", "sortable": True},
+                    {"name": "side", "label": "Side", "field": "side"},
+                    {"name": "caller", "label": "Caller", "field": "caller", "sortable": True},
+                    {"name": "status", "label": "Status", "field": "status", "sortable": True},
+                    {"name": "skip_reason", "label": "Skip reason", "field": "skip_reason", "sortable": True},
+                    {"name": "portal_pnl_pct", "label": "Portal %", "field": "portal_pnl_pct"},
+                    {"name": "portal_pnl_usd", "label": "Portal $", "field": "portal_pnl_usd"},
+                    {"name": "bot_pnl_usd", "label": "Bot $", "field": "bot_pnl_usd"},
+                    {"name": "bot_margin", "label": "Margin", "field": "bot_margin"},
+                    {"name": "bot_notional", "label": "Size $", "field": "bot_notional"},
+                    {"name": "bot_fee_usd", "label": "Fee", "field": "bot_fee_usd"},
+                ],
+                rows=trade_rows, row_key="trade_id",
+                pagination={"rowsPerPage": 50},
+            ).classes("w-full")
 
 
 def _feed_color(kind: str) -> str:
