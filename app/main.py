@@ -428,6 +428,16 @@ async def _auto_trail_stop_after_tp(
         log.warning("AUTO TRAILING: skip #%s — HL client not ready", trade_id)
         return
 
+    # Caller's stop wins: once they've broadcast an explicit SL move, we defer
+    # to them entirely and never override with the auto-BE ladder. The ladder
+    # is only the fallback for when the caller stays silent.
+    if db.has_caller_sl_move(int(trade_id)):
+        log.info(
+            "AUTO TRAILING: skip #%s — caller is managing the stop (broadcast "
+            "an SL move); deferring to their stop", trade_id,
+        )
+        return
+
     # Infer tp_num when the portal omits it.
     if tp_num is None:
         inferred = db.get_tp_update_count(int(trade_id))
@@ -506,6 +516,7 @@ async def _auto_trail_stop_after_tp(
         )
         db.insert_sl_update(
             trade_id=int(trade_id), old_stop=current_stop, new_stop=new_stop,
+            source="auto",
         )
         _push_activity(
             "stop_update",
@@ -601,9 +612,9 @@ async def handle_stop_update(event: dict) -> None:
         )
         db.insert_sl_update(
             trade_id=int(trade_id), old_stop=opened.get("entry_sl"),
-            new_stop=float(new_stop),
+            new_stop=float(new_stop), source="caller",
         )
-        log.info("SL updated #%s → %s", trade_id, new_stop)
+        log.info("SL updated #%s → %s (caller move)", trade_id, new_stop)
         notifier.notify_sl_moved(
             coin=coin, side=side, old_stop=opened.get("entry_sl"),
             new_stop=float(new_stop), reason="portal update",
