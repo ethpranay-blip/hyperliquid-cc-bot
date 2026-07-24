@@ -26,8 +26,10 @@ from typing import Optional
 #   TP / profit → 1.0%  — booking a winner at 1% off is still a winner
 # Per-deploy override via env vars; future dashboard exposure planned.
 DEFAULT_ENTRY_SLIP_PCT = 0.005   # 0.5%
-DEFAULT_TP_SLIP_PCT    = 0.010   # 1.0%
+DEFAULT_TP_SLIP_PCT    = 0.010   # 1.0%  (reactive partial-TP fallback path)
 DEFAULT_SL_SLIP_PCT    = 0.005   # 0.5%  (HL's resting SL trigger is the safety net)
+DEFAULT_TP_BAND_PCT    = 0.005   # 0.5%  (protective band on PRE-PLACED TP trigger-limits)
+DEFAULT_TP_SIZE_PCT    = 25.0    # book 25% per TP when the caller doesn't give a size
 
 
 def _read_env_slip(env_var: str, default: float) -> float:
@@ -69,6 +71,117 @@ def get_default_slip_pct() -> float:
     """Back-compat for callers that don't yet specify per-action cap.
     Returns the ENTRY cap (the conservative choice)."""
     return get_entry_slip_pct()
+
+
+def get_tp_band_pct() -> float:
+    """Protective-limit band for PRE-PLACED TP trigger orders. Default 0.5% —
+    the caller wants TPs filled within 0.5% of their posted TP price."""
+    return _read_env_slip("TP_PREPLACE_BAND_PCT", DEFAULT_TP_BAND_PCT)
+
+
+def preplace_tps_enabled() -> bool:
+    """Kill-switch for TP pre-placement (default ON). Set PREPLACE_TPS=0/false
+    to fall back to purely reactive TP handling without a code change."""
+    raw = os.environ.get("PREPLACE_TPS", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _tp_num(v) -> Optional[float]:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def normalize_take_profits(tps, *, default_pct: float = DEFAULT_TP_SIZE_PCT) -> list[dict]:
+    """Normalize a portal take-profits value into [{'price','size_pct'}, ...].
+
+    Accepts a scalar, a list of numbers, or a list of dicts (price under any of
+    price/tp/level/value/tpPrice; size under size/sizePct/pct/percent). A size
+    given as a fraction in (0,1] is read as a percentage (0.25 → 25%). Missing
+    size → default_pct (25%). Non-positive prices are dropped. Cumulative
+    size_pct is capped at 100 (reduce-only would reject any oversell anyway).
+    Order is preserved (TP1, TP2, …).
+    """
+    out: list[dict] = []
+    if tps is None:
+        return out
+    if not isinstance(tps, (list, tuple)):
+        tps = [tps]
+    total = 0.0
+    for t in tps:
+        price = None
+        pct = None
+        if isinstance(t, dict):
+            for k in ("price", "tp", "level", "value", "tpPrice"):
+                price = _tp_num(t.get(k))
+                if price is not None:
+                    break
+            for k in ("size_pct", "sizePct", "pct", "percent", "size"):
+                pct = _tp_num(t.get(k))
+                if pct is not None:
+                    break
+        else:
+            price = _tp_num(t)
+        if price is None or price <= 0:
+            continue
+        if pct is None or pct <= 0:
+            pct = default_pct
+        elif pct <= 1.0:          # a fraction like 0.25 → 25%
+            pct = pct * 100.0
+        remaining = max(0.0, 100.0 - total)
+        pct = min(pct, remaining)
+        if pct <= 0:
+            break                 # already at 100% booked
+        total += pct
+        out.append({"price": float(price), "size_pct": float(pct)})
+    return out
+
+
+def plan_tp_legs(
+    *,
+    position_size: float,
+    tps,
+    ref_price: float,
+    is_long: bool,
+    band_pct: Optional[float] = None,
+    default_pct: float = DEFAULT_TP_SIZE_PCT,
+) -> list[dict]:
+    """Plan reduce-only TP legs for a filled position (pure; caller rounds).
+
+    Returns [{'trigger_px','limit_px','size','size_pct'}, ...] where:
+      - trigger_px = the caller's TP price (order fires when price reaches it)
+      - limit_px   = protective limit `band_pct` inside the TP (fills within band)
+      - size       = position_size × size_pct/100 (UNROUNDED — caller applies sz_decimals)
+
+    Only TPs on the profit side survive (long: above ref; short: below ref) so
+    a mis-posted TP can't fire instantly as a loss. Sizes/prices are unrounded;
+    the caller rounds and drops any leg that rounds to zero size.
+    """
+    if band_pct is None:
+        band_pct = get_tp_band_pct()
+    if position_size is None or position_size <= 0:
+        return []
+    legs: list[dict] = []
+    for tp in normalize_take_profits(tps, default_pct=default_pct):
+        price = tp["price"]
+        if is_long and price <= ref_price:
+            continue
+        if (not is_long) and price >= ref_price:
+            continue
+        # exit is the opposite side of the position
+        limit_px = slippage_capped_limit(
+            level=price, is_buy=(not is_long), slip_pct=band_pct,
+        )
+        legs.append({
+            "trigger_px": price,
+            "limit_px": limit_px,
+            "size": position_size * (tp["size_pct"] / 100.0),
+            "size_pct": tp["size_pct"],
+        })
+    return legs
 
 
 def sl_triggers_immediately(

@@ -61,7 +61,10 @@ from app.execution import (
     LevelSlippageExceeded,
     enforce_slip,
     get_entry_slip_pct,
+    get_tp_band_pct,
     get_tp_slip_pct,
+    plan_tp_legs,
+    preplace_tps_enabled,
     sl_triggers_immediately,
     slippage_capped_limit,
 )
@@ -136,6 +139,7 @@ class OpenResult:
     # should prefer this over entry_price when non-null.
     my_fill_price: Optional[float] = None
     fee: Optional[float] = None
+    tps_placed: int = 0          # how many of the caller's TP legs rest on HL
     raw: dict = field(default_factory=dict)
 
 
@@ -326,6 +330,28 @@ def sl_cloid_for(trade_id: int) -> Cloid:
     return Cloid.from_str(f"0x{(int(trade_id) | (1 << 127)):032x}")
 
 
+# TP cloids mark bit 126 (with the 1-based TP index in bits 120-125), keeping
+# them disjoint from entry (bits 126,127 = 0) and SL (bit 127 = 1). This lets
+# the place-before-cancel SL trail tell a resting TP from a superseded stop and
+# NOT cancel it — see _cancel_other_sls / _is_tp_cloid_raw.
+def tp_cloid_for(trade_id: int, idx: int) -> Cloid:
+    """Deterministic TP-order Cloid for the idx-th TP (idx starts at 1)."""
+    num = int(trade_id) | (1 << 126) | (int(idx) << 120)
+    return Cloid.from_str(f"0x{num & ((1 << 128) - 1):032x}")
+
+
+def _is_tp_cloid_raw(cloid_raw: Optional[str]) -> bool:
+    """True if a raw cloid hex string is one of our TP cloids (bit 126 set,
+    bit 127 clear)."""
+    if not cloid_raw:
+        return False
+    try:
+        n = int(str(cloid_raw), 16)
+    except (ValueError, TypeError):
+        return False
+    return bool(n & (1 << 126)) and not (n & (1 << 127))
+
+
 # ============================================================
 # SECTION: HyperliquidClient
 # ============================================================
@@ -453,6 +479,9 @@ class HyperliquidClient:
 
         # Track current SL cloid per trade_id for modify_order()
         self._sl_cloids: dict[int, Cloid] = {}
+        # trade_id → [TP cloids] placed on HL (for cleanup on close). Deterministic
+        # (tp_cloid_for), so cleanup also works after a restart loses this map.
+        self._tp_cloids: dict[int, list] = {}
 
         # Phase-2: callback fired whenever HL userEvents WS reports a
         # change to user state (fills, manual closes, manual SL moves).
@@ -847,6 +876,7 @@ class HyperliquidClient:
         risk_usd: Optional[float] = None,
         available_margin: Optional[float] = None,
         slip_pct: Optional[float] = None,
+        take_profits: Optional[list] = None,
     ) -> OpenResult:
         side_l = side.lower()
         if side_l not in ("long", "short", "buy", "sell"):
@@ -926,17 +956,27 @@ class HyperliquidClient:
 
         if self.dry_run:
             self._sl_cloids[trade_id] = sl_cloid if sl_cloid else cloid_for(trade_id)
+            _dry_tps = len(plan_tp_legs(
+                position_size=(size or 1.0), tps=take_profits,
+                ref_price=entry_px, is_long=is_buy, band_pct=get_tp_band_pct(),
+            )) if (take_profits and preplace_tps_enabled()) else 0
             return OpenResult(
                 trade_id=trade_id, coin=order_name, side=side_l,
                 size=size, entry_price=entry_px, stop_price=sl_px,
                 entry_cloid=entry_cloid.to_raw() if hasattr(entry_cloid, "to_raw") else str(entry_cloid),
                 sl_cloid=(sl_cloid.to_raw() if sl_cloid and hasattr(sl_cloid, "to_raw") else (str(sl_cloid) if sl_cloid else None)),
                 dry_run=True,
+                tps_placed=_dry_tps,
                 raw={"mock": True, "status": "ok"},
             )
 
         if self._exchange is None:
             raise HyperliquidError("SDK not initialized (missing credentials)")
+
+        # Self-heal: clear any orphan TP triggers left on this coin by a prior
+        # trade whose HL-side SL fired (one position per coin, so any resting TP
+        # here is stale). Prevents a stale TP from reducing this new position.
+        self._cancel_tps(trade_id, order_name)
 
         # Set per-asset leverage — best-effort; not atomic w/ order.
         # Margin mode comes from HL_MARGIN_MODE env (default isolated). This
@@ -1016,6 +1056,20 @@ class HyperliquidClient:
                 trade_id, entry_px, avg_fill_px, fee,
             )
 
+        # Pre-place the caller's TP ladder on HL (reduce-only trigger-limits),
+        # sized to the actual filled position, so TPs execute the moment price
+        # reaches the caller's levels — no dependence on a portal tp_hit event.
+        # Non-fatal: a failure leaves the position entered + SL-protected.
+        tps_placed = 0
+        try:
+            tps_placed = await self._place_tp_ladder(
+                trade_id=trade_id, order_name=order_name, is_buy=is_buy,
+                sz_dec=sz_dec, ref_price=(avg_fill_px or entry_px),
+                take_profits=take_profits, fallback_size=size, dex=dex,
+            )
+        except Exception:
+            log.exception("TP ladder #%s: unexpected error (non-fatal)", trade_id)
+
         return OpenResult(
             trade_id=trade_id, coin=order_name, side=side_l,
             size=size, entry_price=entry_px, stop_price=sl_px,
@@ -1024,6 +1078,7 @@ class HyperliquidClient:
             dry_run=False,
             my_fill_price=avg_fill_px,
             fee=fee,
+            tps_placed=tps_placed,
             raw=resp if isinstance(resp, dict) else {"raw": resp},
         )
 
@@ -1216,9 +1271,11 @@ class HyperliquidClient:
         # as order_name for HIP-3 too
         fee, pnl, avg_px = await self._reconcile_fills(order_name, close_started_at)
 
-        # If fully closed, drop the tracked SL cloid
+        # If fully closed, drop the tracked SL cloid and cancel any resting TP
+        # legs (they'd otherwise orphan / fire on a future same-coin position).
         if not is_partial:
             self._sl_cloids.pop(trade_id, None)
+            self._cancel_tps(trade_id, order_name)
 
         return CloseResult(
             trade_id=trade_id, coin=order_name, size=close_size,
@@ -1297,11 +1354,11 @@ class HyperliquidClient:
         the one with cloid `keep_cloid_raw`. Returns count cancelled.
 
         Used by the place-before-cancel SL update: after the NEW stop is
-        confirmed resting, this removes the prior stop(s). Because this bot
-        keeps one position per coin and only ever rests SL triggers (never
-        resting TP triggers), "all reduce-only triggers for this coin except
-        the new one" == "the superseded stops" — so this also self-heals any
-        orphaned stops left by a past failed cancel.
+        confirmed resting, this removes the prior stop(s). Reduce-only TP
+        triggers (pre-placed take-profits) are EXPLICITLY skipped via their
+        cloid marker — otherwise every SL trail would wipe the caller's TPs.
+        Among the remaining reduce-only triggers, "all except the new one" ==
+        "the superseded stops" — so this also self-heals orphaned stops.
         """
         if self._exchange is None or self._info is None or not self.main_address:
             return 0
@@ -1322,6 +1379,8 @@ class HyperliquidClient:
             is_trigger = o.get("isTrigger") or "stop" in otype or "trigger" in otype
             if not is_trigger:
                 continue
+            if _is_tp_cloid_raw(o.get("cloid")):
+                continue  # a pre-placed TP — NOT a superseded stop, keep it
             if (o.get("cloid") or "").lower() == keep:
                 continue  # this is the new stop — keep it
             to_cancel.append({"coin": order_name, "oid": o["oid"]})
@@ -1336,6 +1395,125 @@ class HyperliquidClient:
             log.warning("bulk_cancel (cancel-other-sls) failed for %s: %s", order_name, exc)
             return 0
         return len(to_cancel)
+
+    def _cancel_tps(self, trade_id: int, order_name: str) -> int:
+        """Cancel every resting reduce-only TP trigger (our cloid marker) for
+        `order_name`. Called on full close and — defensively — at the start of a
+        new entry, so an orphan TP from a prior HL-side SL close can never fire
+        on a future position for the same coin. Idempotent."""
+        self._tp_cloids.pop(trade_id, None)
+        if self._exchange is None or self._info is None or not self.main_address:
+            return 0
+        try:
+            orders = self._info.frontend_open_orders(self.main_address)
+        except Exception as exc:
+            log.warning("frontend_open_orders failed (cancel-tps): %s", exc)
+            return 0
+        to_cancel = [
+            {"coin": order_name, "oid": o["oid"]}
+            for o in (orders or [])
+            if isinstance(o, dict) and o.get("coin") == order_name
+            and o.get("reduceOnly") and _is_tp_cloid_raw(o.get("cloid"))
+        ]
+        if not to_cancel:
+            return 0
+        try:
+            resp = self._exchange.bulk_cancel(to_cancel)
+            _check_hl_response(resp) if isinstance(resp, dict) else None
+            log.info("canceled %d TP order(s) for %s", len(to_cancel), order_name)
+        except Exception as exc:
+            log.warning("bulk_cancel (TPs) failed for %s: %s", order_name, exc)
+            return 0
+        return len(to_cancel)
+
+    async def _place_tp_ladder(
+        self, *, trade_id: int, order_name: str, is_buy: bool, sz_dec: int,
+        ref_price: float, take_profits, fallback_size: Optional[float] = None,
+        dex: str = "",
+    ) -> int:
+        """Pre-place the caller's TP ladder as reduce-only trigger-LIMIT orders.
+
+        Sized to the ACTUAL current position (queried from HL), 25% per TP (or
+        the caller's size), filling within a 0.5% band of each TP price. Placed
+        as an independent (`grouping="na"`) bulk AFTER the entry+SL bracket —
+        the proven entry+SL path is untouched, and a failure here degrades to
+        reactive TP handling (position is still entered + SL-protected).
+        Returns the number of TP legs placed.
+        """
+        if not preplace_tps_enabled() or not take_profits:
+            return 0
+        if self.dry_run:
+            # Nothing rests on HL, but report what WOULD be placed for tracking.
+            return len(plan_tp_legs(
+                position_size=1.0, tps=take_profits, ref_price=ref_price,
+                is_long=is_buy, band_pct=get_tp_band_pct(),
+            ))
+        if self._exchange is None:
+            return 0
+
+        # Prefer the live position size; fall back to the ordered size if the
+        # position hasn't propagated to user_state yet (fills → position update
+        # can lag by a tick). Over-sizing is safe: the TP legs are reduce-only,
+        # so HL caps each to what's actually there.
+        pos_size = await self._current_position_size(order_name)
+        if pos_size is None or pos_size <= 0:
+            pos_size = fallback_size
+        if pos_size is None or pos_size <= 0:
+            log.warning(
+                "TP ladder #%s: no position size for %s (live or ordered) — "
+                "skipping pre-placement; reactive TP handling still applies",
+                trade_id, order_name,
+            )
+            return 0
+
+        legs = plan_tp_legs(
+            position_size=float(pos_size), tps=take_profits, ref_price=ref_price,
+            is_long=is_buy, band_pct=get_tp_band_pct(),
+        )
+        orders: list[dict] = []
+        cloids: list = []
+        for idx, leg in enumerate(legs, start=1):
+            sz = round(leg["size"], sz_dec)
+            if sz <= 0:
+                continue
+            cl = tp_cloid_for(trade_id, idx)
+            cloids.append(cl)
+            orders.append({
+                "coin": order_name, "is_buy": (not is_buy), "sz": sz,
+                "limit_px": round_px(leg["limit_px"], sz_dec),
+                "order_type": {"trigger": {
+                    "triggerPx": round_px(leg["trigger_px"], sz_dec),
+                    "isMarket": False, "tpsl": "tp",
+                }},
+                "reduce_only": True, "cloid": cl,
+            })
+        if not orders:
+            return 0
+
+        exchange = self._exchange
+
+        def _submit():
+            try:
+                return exchange.bulk_orders(orders, grouping="na")
+            except TypeError:
+                return exchange.bulk_orders(orders)
+
+        try:
+            resp = await self._with_retry(_submit, desc=f"tp_ladder #{trade_id}")
+            _check_hl_response(resp) if isinstance(resp, dict) else None
+        except Exception:
+            log.exception(
+                "TP ladder #%s: placement FAILED — position stays entered + "
+                "SL-protected; reactive TP handling still applies", trade_id,
+            )
+            return 0
+        self._tp_cloids[trade_id] = cloids
+        log.info(
+            "TP ladder #%s %s: placed %d TP(s) %s",
+            trade_id, order_name, len(orders),
+            [round_px(l["trigger_px"], sz_dec) for l in legs[:len(orders)]],
+        )
+        return len(orders)
 
     def _fresh_sl_cloid(self, trade_id: int) -> Cloid:
         """A unique SL cloid per update, so a NEW stop can be placed while the
@@ -1589,6 +1767,9 @@ class HyperliquidClient:
             }
         if self._exchange is None:
             raise HyperliquidError("SDK not initialized (missing credentials)")
+
+        # Self-heal orphan TP triggers on this coin before parking a new bracket.
+        self._cancel_tps(trade_id, order_name)
 
         if not await self._set_leverage(
             order_name, int(lev), cross=self.use_cross_margin, dex=dex,
