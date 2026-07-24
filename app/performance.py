@@ -20,8 +20,14 @@ Caveats baked into the math:
 - Portal activity feed has a rolling window; trades that closed weeks ago
   may have rolled off. Trades in the bot DB but not in the portal window
   get status="bot_only" and contribute to "bot $" but not the comparison.
-- Portal's pnlPct is treated as ROI on margin (the perp display
-  convention). Hypothetical $ = per_trade_margin * pnl_pct.
+- Portal's pnlPct is the caller's *1x price move* in PERCENTAGE POINTS
+  (e.g. -1.65 = a -1.65% move), NOT a decimal and NOT leveraged ROI. It is
+  divided by 100 into a fraction at reconcile, then priced at the bot's
+  NOTIONAL (size x entry) — real notional on trades we took, a representative
+  notional on ones we missed — so it is comparable to the bot's realized
+  (leveraged) dollars. Pricing it at *margin* would understate it by the
+  leverage factor; multiplying the raw percentage-point value overstated it
+  ~100x. See _portal_usd().
 - "Open" portal trades (no close event yet) carry no pnl_pct and don't
   affect the comparison totals, but show in the reconciliation list.
 """
@@ -54,7 +60,7 @@ class ReconciledTrade:
     side: str  # "long" / "short"
     portal_opened_at: Optional[int] = None    # epoch ms
     portal_closed_at: Optional[int] = None
-    portal_pnl_pct: Optional[float] = None    # decimal (0.15 = +15%)
+    portal_pnl_pct: Optional[float] = None    # decimal fraction (0.15 = +15%), /100'd from the feed's percentage-points
     portal_close_price: Optional[float] = None
     bot_status: str = STATUS_MISSED
     bot_pnl_usd: Optional[float] = None
@@ -229,7 +235,10 @@ def reconcile(
             side=p["side"],
             portal_opened_at=p["opened_at"],
             portal_closed_at=p["closed_at"],
-            portal_pnl_pct=p["pnl_pct"],
+            # Feed sends pnlPct in PERCENTAGE POINTS (e.g. 3.03 = +3.03%);
+            # store as a decimal fraction. Single funnel: both the live-aggregated
+            # and persisted-merged paths land in p["pnl_pct"] before this.
+            portal_pnl_pct=(p["pnl_pct"] / 100.0) if p["pnl_pct"] is not None else None,
             portal_close_price=p["close_price"],
         )
         if tid in bot_closed_by_id:
@@ -287,10 +296,22 @@ def reconcile(
     return reconciled
 
 
+def _portal_usd(r: ReconciledTrade, rep_notional: float) -> float:
+    """Dollar value of the caller's price move at the bot's position SIZE.
+
+    portal_pnl_pct is the caller's 1x price move as a fraction. We price it at
+    NOTIONAL (not margin) so it's comparable to the bot's realized, leveraged
+    PnL: the bot's own notional on a trade we took, else the representative
+    notional (our typical position size) on one we missed/rolled off.
+    """
+    notional = r.bot_notional_usd if r.bot_notional_usd else rep_notional
+    return (r.portal_pnl_pct or 0.0) * notional
+
+
 def summarize(
     reconciled: list[ReconciledTrade],
     *,
-    per_trade_margin_usd: float,
+    per_trade_notional_usd: float,
 ) -> dict:
     """Headline metrics + per-caller breakdown.
 
@@ -306,11 +327,15 @@ def summarize(
         r for r in reconciled
         if r.portal_pnl_pct is not None and r.bot_pnl_usd is not None
     ]
-    direct_portal_usd = sum(r.portal_pnl_pct * per_trade_margin_usd for r in direct)
-    direct_bot_usd = sum(r.bot_pnl_usd for r in direct)
+    # Matched trades always carry a bot notional, so _portal_usd prices each at
+    # the SAME size the bot actually used — a true apples-to-apples gap.
+    direct_portal_usd = sum(_portal_usd(r, per_trade_notional_usd) for r in direct)
+    direct_bot_usd = sum(r.bot_pnl_usd for r in direct)          # gross (closedPnl)
+    direct_bot_fees_usd = sum(r.bot_fee_usd or 0.0 for r in direct)
+    direct_bot_net_usd = direct_bot_usd - direct_bot_fees_usd    # after fees
 
     portal_completed = [r for r in reconciled if r.portal_pnl_pct is not None]
-    portal_all_usd = sum(r.portal_pnl_pct * per_trade_margin_usd for r in portal_completed)
+    portal_all_usd = sum(_portal_usd(r, per_trade_notional_usd) for r in portal_completed)
 
     bot_closed = [
         r for r in reconciled
@@ -346,7 +371,7 @@ def summarize(
             s["portal_completed"] += 1
             if r.portal_pnl_pct > 0:
                 s["portal_wins"] += 1
-            s["portal_pnl_usd"] += r.portal_pnl_pct * per_trade_margin_usd
+            s["portal_pnl_usd"] += _portal_usd(r, per_trade_notional_usd)
         if r.bot_status == STATUS_COPIED_CLOSED:
             s["bot_copied_closed"] += 1
             if r.bot_pnl_usd is not None:
@@ -371,9 +396,9 @@ def summarize(
     }
 
     # --- Missed-trade cost, split by WHY it was skipped ---
-    # $ = portal_pnl_pct × per_trade_margin: what the same completed portal
-    # trade would have made/lost at your per-trade margin. Positive total =
-    # money left on the table; negative = the skips dodged losers.
+    # $ = the caller's move priced at our representative notional (see
+    # _portal_usd): what the same trade would have made/lost at our typical
+    # size. Positive total = money left on the table; negative = dodged losers.
     missed = [r for r in reconciled if r.bot_status == STATUS_MISSED]
     missed_by_reason: dict[str, dict] = {}
     for r in missed:
@@ -389,7 +414,7 @@ def summarize(
         s["count"] += 1
         if r.portal_pnl_pct is not None:
             s["completed"] += 1
-            usd = r.portal_pnl_pct * per_trade_margin_usd
+            usd = _portal_usd(r, per_trade_notional_usd)
             s["portal_usd"] += usd
             if usd > 0:
                 s["cost_usd"] += usd
@@ -400,7 +425,7 @@ def summarize(
         missed_completed, key=lambda r: r.portal_pnl_pct, default=None,
     )
     _missed_usds = [
-        r.portal_pnl_pct * per_trade_margin_usd for r in missed_completed
+        _portal_usd(r, per_trade_notional_usd) for r in missed_completed
     ]
     missed_stats = {
         "count": len(missed),
@@ -416,7 +441,7 @@ def summarize(
                 "trade_id": biggest_missed.trade_id,
                 "coin": biggest_missed.coin,
                 "caller": biggest_missed.caller,
-                "portal_usd": biggest_missed.portal_pnl_pct * per_trade_margin_usd,
+                "portal_usd": _portal_usd(biggest_missed, per_trade_notional_usd),
                 "reason": biggest_missed.skip_reason or "unknown",
             }
             if biggest_missed is not None else None
@@ -426,11 +451,13 @@ def summarize(
     return {
         "taken": taken_stats,
         "missed": missed_stats,
-        # Direct comparison (apples-to-apples)
+        # Direct comparison (apples-to-apples, priced at the bot's real notional)
         "direct_count": len(direct),
         "direct_portal_usd": direct_portal_usd,
-        "direct_bot_usd": direct_bot_usd,
-        "direct_diff_usd": direct_bot_usd - direct_portal_usd,
+        "direct_bot_usd": direct_bot_usd,             # gross
+        "direct_bot_fees_usd": direct_bot_fees_usd,
+        "direct_bot_net_usd": direct_bot_net_usd,     # after fees
+        "direct_diff_usd": direct_bot_net_usd - direct_portal_usd,
 
         # Wider totals
         "portal_completed_count": len(portal_completed),
@@ -445,21 +472,21 @@ def summarize(
         # Composition
         "status_counts": status_counts,
         "by_caller": by_caller_list,
-        "per_trade_margin_usd": per_trade_margin_usd,
+        "per_trade_notional_usd": per_trade_notional_usd,
     }
 
 
 def cumulative_series(
     reconciled: list[ReconciledTrade],
     *,
-    per_trade_margin_usd: float,
+    per_trade_notional_usd: float,
 ) -> dict:
     """Time-ordered cumulative-PnL curves for charting.
 
     Returns {"portal": [[ts_ms, cum_usd], ...], "bot": [[ts_ms, cum_usd], ...]}.
 
     - Portal curve: every completed portal trade (pnl_pct present), at its
-      portal close timestamp, $ = pnl_pct × per_trade_margin.
+      portal close timestamp, $ = _portal_usd (caller's move at bot notional).
     - Bot curve: every bot-closed trade (pnl present), at its bot close
       timestamp.
     Points missing a usable timestamp are dropped (a curve needs an x-axis);
@@ -470,7 +497,7 @@ def cumulative_series(
     missed_pts: list[tuple[int, float]] = []
     for r in reconciled:
         if r.portal_pnl_pct is not None and r.portal_closed_at:
-            usd = r.portal_pnl_pct * per_trade_margin_usd
+            usd = _portal_usd(r, per_trade_notional_usd)
             portal_pts.append((int(r.portal_closed_at), usd))
             if r.bot_status == STATUS_MISSED:
                 # The "cost of missing" curve — same trades, never taken.
@@ -499,7 +526,7 @@ _DAY_MS = 86_400_000
 def window_summary(
     reconciled: list[ReconciledTrade],
     *,
-    per_trade_margin_usd: float,
+    per_trade_notional_usd: float,
     now_ms: int,
     windows: tuple = ((7, "7D"), (30, "30D"), (90, "90D"), (None, "All time")),
 ) -> list[dict]:
@@ -523,14 +550,14 @@ def window_summary(
             and (cutoff is None or r.bot_closed_at >= cutoff)
         ]
         missed_usd = sum(
-            r.portal_pnl_pct * per_trade_margin_usd
+            _portal_usd(r, per_trade_notional_usd)
             for r in portal_rows if r.bot_status == STATUS_MISSED
         )
         bot_usd = sum(r.bot_pnl_usd for r in bot_rows)
         out.append({
             "label": label,
             "portal_usd": sum(
-                r.portal_pnl_pct * per_trade_margin_usd for r in portal_rows
+                _portal_usd(r, per_trade_notional_usd) for r in portal_rows
             ),
             "portal_n": len(portal_rows),
             "bot_usd": bot_usd,
@@ -544,7 +571,7 @@ def window_summary(
 def weekly_pnl(
     reconciled: list[ReconciledTrade],
     *,
-    per_trade_margin_usd: float,
+    per_trade_notional_usd: float,
 ) -> dict:
     """Per-week PnL buckets (Mon-start, UTC) for grouped bar charts —
     the dumbed-down replacement for cumulative line curves.
@@ -565,7 +592,7 @@ def weekly_pnl(
 
     for r in reconciled:
         if r.portal_pnl_pct is not None and r.portal_closed_at:
-            usd = r.portal_pnl_pct * per_trade_margin_usd
+            usd = _portal_usd(r, per_trade_notional_usd)
             slot = _slot(int(r.portal_closed_at))
             slot["portal"] += usd
             if r.bot_status == STATUS_MISSED:
