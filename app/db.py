@@ -57,6 +57,10 @@ CREATE TABLE IF NOT EXISTS hl_opened_trades (
     margin       REAL    NOT NULL,
     leverage     REAL    NOT NULL,
     caller       TEXT,
+    -- 1 when the caller's TP ladder was pre-placed on HL for this trade. The
+    -- reactive tp_hit handler then skips booking (HL owns the partials) to
+    -- avoid double-closing. NULL/0 → legacy reactive booking.
+    tps_preplaced INTEGER DEFAULT 0,
     at           TEXT    NOT NULL
 );
 
@@ -247,6 +251,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE hl_sl_updates ADD COLUMN source TEXT;")
         log.info("migration: added hl_sl_updates.source")
 
+    if not _has_col("hl_opened_trades", "tps_preplaced"):
+        conn.execute(
+            "ALTER TABLE hl_opened_trades ADD COLUMN tps_preplaced INTEGER DEFAULT 0;"
+        )
+        log.info("migration: added hl_opened_trades.tps_preplaced")
+
 
 def init_db(db_path: Optional[str | Path] = None) -> None:
     """Initialize the database file and apply the schema.
@@ -412,14 +422,15 @@ def insert_opened_trade(
     leverage: float,
     caller: Optional[str],
     my_fill_price: Optional[float] = None,
+    tps_preplaced: bool = False,
     at: Optional[str] = None,
 ) -> int:
     cur = _execute(
         """
         INSERT INTO hl_opened_trades
             (trade_id, coin, side, entry_price, my_fill_price, entry_sl,
-             size, margin, leverage, caller, at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+             size, margin, leverage, caller, tps_preplaced, at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             int(trade_id),
@@ -432,6 +443,7 @@ def insert_opened_trade(
             float(margin),
             float(leverage),
             caller,
+            1 if tps_preplaced else 0,
             at or _utcnow_iso(),
         ),
     )

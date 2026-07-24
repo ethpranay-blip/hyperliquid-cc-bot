@@ -662,6 +662,26 @@ async def handle_tp_hit(event: dict) -> None:
     # Caller-posted TP price → used as the strict slippage cap reference.
     tp_level = float(tp_price) if tp_price is not None else None
 
+    # If we pre-placed the TP ladder on HL, HL already booked (or will book)
+    # this partial the moment price reached the level — so DON'T re-send it here
+    # (that would double-close). Record it + trail the stop (fallback), then stop.
+    if opened.get("tps_preplaced") and float(size_pct) < 100:
+        db.insert_tp_update(
+            trade_id=int(trade_id),
+            tp_price=float(tp_price) if tp_price is not None else 0.0,
+            tp_pct=float(size_pct), tp_num=tp_num,
+        )
+        notifier.notify_tp_hit(
+            coin=coin, side=side, tp_price=tp_price, size_pct=float(size_pct),
+            tp_num=tp_num, trade_id=int(trade_id), dry_run=state.dry_run,
+        )
+        await _auto_trail_stop_after_tp(
+            trade_id=int(trade_id), coin=coin, side=side,
+            tp_num=tp_num, opened=opened,
+        )
+        state.fire_refresh()
+        return
+
     try:
         if float(size_pct) >= 100:
             # Treated as full close
@@ -1056,6 +1076,7 @@ async def enter_trade(trade_id: int) -> None:
             leverage=event.get("leverage"),
             sizing_mode=mode, margin_usd=margin_usd, risk_usd=risk_usd,
             available_margin=available,
+            take_profits=event.get("take_profits"),
         )
     except LevelSlippageExceeded as exc:
         # Caller's entry is too far from current mid — never chase. Instead,
@@ -1125,6 +1146,7 @@ async def enter_trade(trade_id: int) -> None:
     # user-facing display.
     # result.my_fill_price is the ACTUAL avg fill from HL; entry_price is the
     # slippage-padded limit we sent. Dashboard/PnL uses my_fill_price when set.
+    _tps_placed = getattr(result, "tps_placed", 0) or 0
     db.insert_opened_trade(
         trade_id=int(trade_id), coin=coin, side=side,
         entry_price=result.entry_price, entry_sl=result.stop_price,
@@ -1132,8 +1154,14 @@ async def enter_trade(trade_id: int) -> None:
         leverage=event.get("leverage") or state.hl.default_leverage,
         caller=caller,
         my_fill_price=getattr(result, "my_fill_price", None),
+        tps_preplaced=_tps_placed > 0,
     )
     db.add_live_trade(int(trade_id))
+    if _tps_placed:
+        _push_activity(
+            "tp_hit", f"🎯 {_tps_placed} TP(s) pre-placed on HL {coin} #{trade_id}",
+            int(trade_id),
+        )
     state.pending_trades.pop(int(trade_id), None)
 
     # Notifier gets the real fill price when available (more accurate message).
