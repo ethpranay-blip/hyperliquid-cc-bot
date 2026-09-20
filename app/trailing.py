@@ -75,3 +75,28 @@ def compute_trailed_stop(
         target = ratcheted
 
     return target, reason
+
+
+def member_breakeven_floor(
+    *,
+    caller_stop: float,
+    fill_price: Optional[float],
+    is_long: bool,
+    tp_hit: bool,
+) -> float:
+    """Once we've booked a TP, never let a MIRRORED caller stop sit worse than
+    the MEMBER's own breakeven (our real fill).
+
+    Guards the "caller's stop wins" policy against a caller who edits their entry
+    DOWN and then moves their "breakeven" stop to that new, lower entry: a member
+    who's in at the original price would otherwise get a stop below their own fill
+    = a locked loss where the caller is flat. So after the first TP, we protect
+    OUR breakeven, not the caller's edited entry.
+
+    Before any TP (tp_hit False) or when the fill is unknown, the caller's stop is
+    their genuine risk stop and is mirrored as-is.
+    """
+    if not tp_hit or fill_price is None:
+        return caller_stop
+    floor = float(fill_price)
+    return max(caller_stop, floor) if is_long else min(caller_stop, floor)

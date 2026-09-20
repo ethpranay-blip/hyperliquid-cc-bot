@@ -58,7 +58,7 @@ from app.performance import (
     STATUS_COPIED_ORPHAN, STATUS_BOT_ONLY,
 )
 from app.portal import PortalClient, PortalAuthError
-from app.trailing import compute_trailed_stop
+from app.trailing import compute_trailed_stop, member_breakeven_floor
 from app.adoption import build_open_trade_index
 from app.auth import auth_enabled, password_ok
 
@@ -159,7 +159,12 @@ STALE_SLACK_MS = 5 * 60 * 1000
 
 # How long a resting GTC entry (parked at the caller's level after the live
 # mid drifted past the slippage cap) waits for a fill before being cancelled.
-RESTING_ENTRY_TTL_MIN = float(os.environ.get("RESTING_ENTRY_TTL_MINUTES", 60))
+# Safety backstop only — a resting zone entry is normally withdrawn by the
+# call's lifecycle (caller closes it, or takes first profit; see handle_full_close
+# / handle_tp_hit), not this clock. Kept long (24h) so we don't abandon a zone
+# that fills an hour or two later — the #3 "be patient" fix. Env-tunable; a
+# resting order does hold a slot + margin while it waits.
+RESTING_ENTRY_TTL_MIN = float(os.environ.get("RESTING_ENTRY_TTL_MINUTES", 1440))
 
 # Dashboard render caps. NiceGUI syncs the whole page's element state to the
 # browser over a single WebSocket message; once it exceeds the transport limit
@@ -605,26 +610,43 @@ async def handle_stop_update(event: dict) -> None:
 
     if state.hl is None:
         return
+
+    # Protect the MEMBER's breakeven, not the caller's (possibly-edited) entry.
+    # After the first TP, a caller "breakeven" move to an entry they edited down
+    # would put our stop below our own fill = a locked loss. Floor it at our fill.
+    fill = opened.get("my_fill_price") or opened.get("entry_price")
+    applied_stop = member_breakeven_floor(
+        caller_stop=float(new_stop),
+        fill_price=float(fill) if fill else None,
+        is_long=side.lower() in ("long", "buy"),
+        tp_hit=db.get_tp_update_count(int(trade_id)) >= 1,
+    )
+    if applied_stop != float(new_stop):
+        log.info(
+            "SL floor #%s: caller stop %s is below our breakeven %s (post-TP) "
+            "— holding our BE instead of locking a loss",
+            trade_id, new_stop, applied_stop,
+        )
     try:
         await state.hl.update_stop(
             trade_id=int(trade_id), portal_coin=coin, side=side,
-            new_portal_stop=float(new_stop), portal_entry=float(entry),
+            new_portal_stop=applied_stop, portal_entry=float(entry),
         )
         db.insert_sl_update(
             trade_id=int(trade_id), old_stop=opened.get("entry_sl"),
-            new_stop=float(new_stop), source="caller",
+            new_stop=applied_stop, source="caller",
         )
-        log.info("SL updated #%s → %s (caller move)", trade_id, new_stop)
+        log.info("SL updated #%s → %s (caller move)", trade_id, applied_stop)
         notifier.notify_sl_moved(
             coin=coin, side=side, old_stop=opened.get("entry_sl"),
-            new_stop=float(new_stop), reason="portal update",
+            new_stop=applied_stop, reason="portal update",
             trade_id=int(trade_id), dry_run=state.dry_run,
         )
     except Exception as exc:
         log.exception("update_stop failed #%s", trade_id)
         # place-before-cancel → prior stop still protecting; alert the move failed.
         notifier.notify_sl_failed(
-            coin=coin, side=side, intended_stop=float(new_stop), reason=str(exc),
+            coin=coin, side=side, intended_stop=applied_stop, reason=str(exc),
             trade_id=int(trade_id), protected=True, dry_run=state.dry_run,
         )
 
@@ -640,6 +662,32 @@ async def handle_tp_hit(event: dict) -> None:
     )
     if trade_id is None or size_pct is None:
         return
+
+    # A resting entry that hasn't filled by the time the caller books first
+    # profit has missed its window (price ran up past our zone) — withdraw it so
+    # it stops holding a slot/margin. Mirrors the caller-close withdrawal.
+    resting = db.get_resting_entry(int(trade_id))
+    if resting is not None and not db.get_live_trade(int(trade_id)):
+        try:
+            if state.hl is not None:
+                await state.hl.cancel_resting_entry(
+                    trade_id=int(trade_id), portal_coin=resting["coin"],
+                )
+        except Exception:
+            log.exception("resting cancel on TP #%s failed", trade_id)
+        db.remove_resting_entry(int(trade_id))
+        db.insert_skipped_trade(
+            trade_id=int(trade_id), coin=resting["coin"],
+            side=resting.get("side"), caller=resting.get("caller"),
+            reason="resting_expired",
+            detail="caller took first profit before our resting entry filled",
+        )
+        _push_activity(
+            "blocked", f"⌛ Resting {resting['coin']} #{trade_id} withdrawn "
+            f"(caller hit TP first)", int(trade_id),
+        )
+        return
+
     if not db.get_live_trade(int(trade_id)):
         return  # not ours or already closed
 
