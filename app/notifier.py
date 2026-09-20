@@ -307,6 +307,34 @@ class Notifier:
         lines.append(f"• {_utcnow()}")
         self._dispatch("\n".join(lines))
 
+    def notify_entry_edited(
+        self,
+        *,
+        coin: str,
+        side: str,
+        our_entry: Optional[float],
+        new_caller_entry: Optional[float],
+        trade_id: Optional[int] = None,
+    ) -> None:
+        """The caller EDITED their entry after we were already in. We do NOT
+        add or re-enter — this is awareness only, so you can see the divergence
+        (our fill vs their new posted entry)."""
+        if not self.enabled:
+            return
+        lines = [
+            "✏️ CALLER EDITED THEIR ENTRY",
+            f"• {coin}  {_side_arrow(side)}",
+        ]
+        if our_entry is not None:
+            lines.append(f"• Our entry: {_fmt_price(our_entry)} (unchanged)")
+        if new_caller_entry is not None:
+            lines.append(f"• Their new entry: {_fmt_price(new_caller_entry)}")
+        lines.append("• We did NOT add / re-enter; stop protects OUR breakeven")
+        if trade_id is not None:
+            lines.append(f"• Trade: #{trade_id}")
+        lines.append(f"• {_utcnow()}")
+        self._dispatch("\n".join(lines))
+
     def notify_skipped(
         self,
         *,
@@ -511,6 +539,10 @@ def notify_sl_failed(**kwargs) -> None:
 
 def notify_resting(**kwargs) -> None:
     _default.notify_resting(**kwargs)
+
+
+def notify_entry_edited(**kwargs) -> None:
+    _default.notify_entry_edited(**kwargs)
 
 
 def reload_from_env() -> None:

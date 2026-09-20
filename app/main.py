@@ -159,12 +159,11 @@ STALE_SLACK_MS = 5 * 60 * 1000
 
 # How long a resting GTC entry (parked at the caller's level after the live
 # mid drifted past the slippage cap) waits for a fill before being cancelled.
-# Safety backstop only — a resting zone entry is normally withdrawn by the
-# call's lifecycle (caller closes it, or takes first profit; see handle_full_close
-# / handle_tp_hit), not this clock. Kept long (24h) so we don't abandon a zone
-# that fills an hour or two later — the #3 "be patient" fix. Env-tunable; a
-# resting order does hold a slot + margin while it waits.
-RESTING_ENTRY_TTL_MIN = float(os.environ.get("RESTING_ENTRY_TTL_MINUTES", 1440))
+# Resting zone entries do NOT expire on a clock (default 0 = never). A zone
+# order waits until it fills, the caller closes the call (handle_full_close), or
+# a newer call needs its margin and bumps it (_free_margin_for_new_call). Set
+# RESTING_ENTRY_TTL_MINUTES > 0 to re-enable a time cap if ever needed.
+RESTING_ENTRY_TTL_MIN = float(os.environ.get("RESTING_ENTRY_TTL_MINUTES", 0))
 
 # Dashboard render caps. NiceGUI syncs the whole page's element state to the
 # browser over a single WebSocket message; once it exceeds the transport limit
@@ -651,6 +650,46 @@ async def handle_stop_update(event: dict) -> None:
         )
 
 
+async def handle_entry_update(event: dict) -> None:
+    """Caller EDITED their entry after posting (the 'voberoi edits entry down'
+    pattern). We NEVER add or re-enter — this records + notifies the divergence
+    (our fill vs their new entry) so it's visible, and our stop keeps protecting
+    OUR breakeven (member_breakeven_floor). Awareness only, no position change."""
+    trade_id = event.get("trade_id")
+    new_entry = event.get("new_entry")
+    if trade_id is None:
+        return
+    opened = db.get_opened_trade(int(trade_id))
+    if opened is None:
+        return  # not one of ours (or unfilled resting — nothing to protect yet)
+    coin = opened["coin"]
+    side = opened["side"]
+    our_entry = opened.get("my_fill_price") or opened.get("entry_price")
+    log.info(
+        "CALLER ENTRY EDIT #%s %s: our entry %s (unchanged) vs their new %s — "
+        "NOT adding/re-entering", trade_id, coin, our_entry, new_entry,
+    )
+    db.insert_portal_event(
+        event_type="enter", trade_id=trade_id, coin=coin, side=side,
+        caller=opened.get("caller"),
+        details={"entry_edited": new_entry, "our_entry": our_entry,
+                 "text": event.get("update_text")},
+    )
+    _push_activity(
+        "stop_update",
+        f"✏️ {coin} #{trade_id} caller edited entry"
+        + (f"→{_fmt_price(new_entry)}" if new_entry else "")
+        + " (we hold OUR entry)",
+        int(trade_id),
+    )
+    notifier.notify_entry_edited(
+        coin=coin, side=side,
+        our_entry=float(our_entry) if our_entry else None,
+        new_caller_entry=float(new_entry) if new_entry else None,
+        trade_id=int(trade_id),
+    )
+
+
 async def handle_tp_hit(event: dict) -> None:
     trade_id = event.get("trade_id")
     size_pct = event.get("size_pct")
@@ -662,32 +701,6 @@ async def handle_tp_hit(event: dict) -> None:
     )
     if trade_id is None or size_pct is None:
         return
-
-    # A resting entry that hasn't filled by the time the caller books first
-    # profit has missed its window (price ran up past our zone) — withdraw it so
-    # it stops holding a slot/margin. Mirrors the caller-close withdrawal.
-    resting = db.get_resting_entry(int(trade_id))
-    if resting is not None and not db.get_live_trade(int(trade_id)):
-        try:
-            if state.hl is not None:
-                await state.hl.cancel_resting_entry(
-                    trade_id=int(trade_id), portal_coin=resting["coin"],
-                )
-        except Exception:
-            log.exception("resting cancel on TP #%s failed", trade_id)
-        db.remove_resting_entry(int(trade_id))
-        db.insert_skipped_trade(
-            trade_id=int(trade_id), coin=resting["coin"],
-            side=resting.get("side"), caller=resting.get("caller"),
-            reason="resting_expired",
-            detail="caller took first profit before our resting entry filled",
-        )
-        _push_activity(
-            "blocked", f"⌛ Resting {resting['coin']} #{trade_id} withdrawn "
-            f"(caller hit TP first)", int(trade_id),
-        )
-        return
-
     if not db.get_live_trade(int(trade_id)):
         return  # not ours or already closed
 
@@ -1001,23 +1014,29 @@ async def _place_resting_entry_for(
         log.exception("resting entry placement failed #%s %s", trade_id, coin)
         return False
 
+    # TTL <= 0 → no clock expiry: park it far in the future so the graduation
+    # loop never times it out. It's withdrawn by lifecycle (caller close) or a
+    # newer call bumping it for margin, not a timer.
+    _ttl = RESTING_ENTRY_TTL_MIN if RESTING_ENTRY_TTL_MIN > 0 else 60 * 24 * 3650
     expires_at = (
-        datetime.now(timezone.utc) + timedelta(minutes=RESTING_ENTRY_TTL_MIN)
+        datetime.now(timezone.utc) + timedelta(minutes=_ttl)
     ).isoformat(timespec="seconds")
     db.insert_resting_entry(
         trade_id=int(trade_id), coin=coin, side=side, caller=caller,
         entry_px=res["entry_px"], sl_px=res["sl_px"], size=res["size"],
         expires_at=expires_at,
     )
+    _wait_note = (f"≤{RESTING_ENTRY_TTL_MIN:g}m"
+                  if RESTING_ENTRY_TTL_MIN > 0 else "until fill/close")
     log.info(
-        "RESTING ENTRY #%s %s %s @ %s (sl=%s sz=%s, expires %s)",
+        "RESTING ENTRY #%s %s %s @ %s (sl=%s sz=%s, waits %s)",
         trade_id, coin, side, res["entry_px"], res["sl_px"], res["size"],
-        expires_at,
+        _wait_note,
     )
     _push_activity(
         "resting",
         f"🕒 RESTING {coin} {side.upper()} @ {_fmt_price(res['entry_px'])} "
-        f"#{trade_id} (waiting ≤{RESTING_ENTRY_TTL_MIN:g}m)",
+        f"#{trade_id} (waiting {_wait_note})",
         int(trade_id),
     )
     notifier.notify_resting(
@@ -1028,6 +1047,50 @@ async def _place_resting_entry_for(
     state.pending_trades.pop(int(trade_id), None)
     state.fire_refresh()
     return True
+
+
+async def _free_margin_for_new_call(
+    *, needed: float, new_trade_id: int, new_coin: str,
+) -> Optional[float]:
+    """Bump the OLDEST unfilled resting order(s) to free their reserved margin
+    for a newer call, then return the refreshed available margin.
+
+    A resting zone order holds margin while it waits. When a fresh call can't
+    fund, we prioritize it by cancelling the oldest resting bracket(s) — one at
+    a time, re-checking margin after each — until there's enough or none are
+    left. Returns the latest available margin (or None if unmeasurable)."""
+    if state.hl is None:
+        return None
+    for row in db.list_resting_entries():          # oldest-first (placed_at ASC)
+        avail = await state.hl.get_available_margin()
+        if avail is not None and avail >= needed:
+            return avail                            # enough freed already
+        rid = int(row["trade_id"])
+        if rid == int(new_trade_id):
+            continue                                # never bump ourselves
+        try:
+            await state.hl.cancel_resting_entry(
+                trade_id=rid, portal_coin=row["coin"],
+            )
+        except Exception:
+            log.exception("margin-bump: cancel resting #%s failed", rid)
+            continue
+        db.remove_resting_entry(rid)
+        db.insert_skipped_trade(
+            trade_id=rid, coin=row["coin"], side=row.get("side"),
+            caller=row.get("caller"), reason="resting_cancelled",
+            detail=f"bumped for newer call #{new_trade_id} ({new_coin}) needing margin",
+        )
+        _push_activity(
+            "blocked",
+            f"↩️ Resting {row['coin']} #{rid} bumped for #{new_trade_id} "
+            f"({new_coin})", rid,
+        )
+        log.info(
+            "margin-bump: cancelled resting #%s (%s) to fund #%s (%s)",
+            rid, row["coin"], new_trade_id, new_coin,
+        )
+    return await state.hl.get_available_margin()
 
 
 async def enter_trade(trade_id: int) -> None:
@@ -1086,6 +1149,16 @@ async def enter_trade(trade_id: int) -> None:
         required = MIN_NOTIONAL_USD / max(float(event.get("leverage") or state.hl.default_leverage), 1.0)
     else:
         required = margin_usd
+
+    # Prioritize this newer call: if we're short, bump the oldest unfilled
+    # resting order(s) holding margin, then re-check before dropping.
+    if available is not None and available < required:
+        freed = await _free_margin_for_new_call(
+            needed=required, new_trade_id=int(trade_id), new_coin=coin,
+        )
+        if freed is not None:
+            available = freed
+
     if available is not None and available < required:
         log.warning(
             "DROPPED #%s %s — insufficient margin: $%.2f avail, $%.2f required "
@@ -1262,10 +1335,11 @@ def dismiss_pending(trade_id: int) -> None:
 # ============================================================
 
 EVENT_HANDLERS = {
-    "new_trade":   handle_new_trade,
-    "stop_update": handle_stop_update,
-    "tp_hit":      handle_tp_hit,
-    "full_close":  handle_full_close,
+    "new_trade":    handle_new_trade,
+    "stop_update":  handle_stop_update,
+    "entry_update": handle_entry_update,
+    "tp_hit":       handle_tp_hit,
+    "full_close":   handle_full_close,
 }
 
 
