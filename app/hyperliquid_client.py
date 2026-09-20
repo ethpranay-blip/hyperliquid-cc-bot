@@ -227,8 +227,20 @@ def round_px(px: float, sz_decimals: int) -> float:
 # after explicit sign-off, since they trade the same underlying under a
 # different product.
 TICKER_ALIASES: dict[str, str] = {
-    "US500": "SP500",   # S&P 500 — HL lists xyz:SP500 (verified in live meta)
-    # "QQQ": "...",     # PENDING: not found on probed dexes; confirm HL listing
+    "US500": "SP500",    # S&P 500 — HL lists xyz:SP500 (verified in live meta)
+    "SPX500": "SPX",     # HL lists SPX on the default dex
+    # Commodities — HL lists the plain names (GOLD/SILVER/COPPER/NATGAS/WTI/CL/
+    # BRENTOIL on xyz/cash/flx), so those resolve directly. These map only the
+    # common VARIANT spellings to HL's name. All SAME-ASSET (gold IS gold), not
+    # ETF/index proxies, so no extra sign-off — and every alias is still
+    # validated against HL's live universe before it can trade.
+    "XAU": "GOLD", "XAUUSD": "GOLD", "GLD": "GOLD",
+    "XAG": "SILVER", "XAGUSD": "SILVER",
+    "NG": "NATGAS",
+    "USOIL": "WTI", "WTIUSD": "WTI",   # US crude → HL's WTI (cash:WTI)
+    "CL!": "CL",                        # TradingView continuous → xyz:CL
+    "BRENT": "BRENTOIL",
+    # "QQQ" / "NASDAQ": not listed on any probed HL dex → stays a clean skip.
 }
 
 

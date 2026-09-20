@@ -589,7 +589,37 @@ class PortalClient:
                     "tp_num": _int(raw.get("tpNum") or raw.get("tpIndex")),
                 }
 
-            # Unknown updateType — drop silently
+            # Caller edited the entry/average AFTER posting (the "voberoi edits
+            # entry down" pattern). We never re-enter or add — this is surfaced
+            # for awareness only (notify + record). Matched broadly since the
+            # exact updateType string isn't documented; the else-branch below
+            # logs any other type so we can tighten this from live data.
+            if ("entry" in update_type or "average" in update_type
+                    or "avg" in update_type):
+                new_entry = _num(
+                    raw.get("newEntry") or raw.get("entry")
+                    or raw.get("entryRaw") or raw.get("avgEntry")
+                    or raw.get("newAverage") or raw.get("average")
+                )
+                if new_entry is None and isinstance(update_text, str):
+                    import re
+                    m = re.search(r"([-+]?\d[\d,]*\.?\d*)",
+                                  update_text.replace(",", ""))
+                    if m:
+                        new_entry = _num(m.group(1))
+                return {
+                    **common,
+                    "type": "entry_update",
+                    "new_entry": new_entry,
+                    "update_text": update_text,
+                }
+
+            # Unrecognized updateType — log it (not silent) so we can learn the
+            # real strings the portal uses (e.g. the true entry-edit type).
+            log.info(
+                "trade_updated: unhandled updateType=%r text=%r tid=%s",
+                update_type, update_text, common.get("trade_id"),
+            )
             return None
 
         # --- stop-loss update (legacy shape) ---
