@@ -42,7 +42,7 @@ from app import db
 from app import notifier
 from app.hyperliquid_client import (
     HyperliquidClient, HyperliquidError, HyperliquidValidationError,
-    hl_symbol_for, is_k_coin, MIN_NOTIONAL_USD,
+    hl_symbol_for, is_k_coin, K_PRICE_MULT, MIN_NOTIONAL_USD,
 )
 from app.execution import (
     LevelSlippageExceeded, get_sl_slip_pct, get_tp_slip_pct,
@@ -613,10 +613,17 @@ async def handle_stop_update(event: dict) -> None:
     # Protect the MEMBER's breakeven, not the caller's (possibly-edited) entry.
     # After the first TP, a caller "breakeven" move to an entry they edited down
     # would put our stop below our own fill = a locked loss. Floor it at our fill.
-    fill = opened.get("my_fill_price") or opened.get("entry_price")
+    # new_stop is in PORTAL units, but our stored fill is in HL units — for
+    # k-coins those differ by 1000×, so convert the fill to portal units first
+    # (else the floor mangles the value → update rejected; the kPEPE incident).
+    fill_hl = opened.get("my_fill_price") or opened.get("entry_price")
+    fill_portal = None
+    if fill_hl:
+        fill_portal = (float(fill_hl) / K_PRICE_MULT
+                       if is_k_coin(coin) else float(fill_hl))
     applied_stop = member_breakeven_floor(
         caller_stop=float(new_stop),
-        fill_price=float(fill) if fill else None,
+        fill_price=fill_portal,
         is_long=side.lower() in ("long", "buy"),
         tp_hit=db.get_tp_update_count(int(trade_id)) >= 1,
     )
