@@ -42,7 +42,7 @@ from app import db
 from app import notifier
 from app.hyperliquid_client import (
     HyperliquidClient, HyperliquidError, HyperliquidValidationError,
-    hl_symbol_for, is_k_coin, K_PRICE_MULT, MIN_NOTIONAL_USD,
+    hl_symbol_for, is_k_coin, K_PRICE_MULT, MIN_NOTIONAL_USD, portal_base_coin,
 )
 from app.execution import (
     LevelSlippageExceeded, get_sl_slip_pct, get_tp_slip_pct,
@@ -1623,10 +1623,13 @@ async def _adopt_untracked_positions(hl_positions: list[dict], only_hl: set) -> 
         log.exception("adopt: could not fetch activity feed — skipping adoption")
         return
 
-    index = build_open_trade_index(raw_events, lambda c: _bare(hl_symbol_for(c)))
+    # Key by the PORTAL base coin on both sides so an HL 'kPEPE' position maps to
+    # its 'PEPE' portal trade — and, crucially, gets STORED as 'PEPE' so every
+    # downstream SL/TP resolve works (the kPEPE incident stored 'kPEPE').
+    index = build_open_trade_index(raw_events, lambda c: portal_base_coin(_bare(c)))
     adopted = 0
     for p in hl_positions:
-        coin_key = _bare(p.get("coin") or "")
+        coin_key = portal_base_coin(_bare(p.get("coin") or ""))
         if coin_key not in only_hl:
             continue
         match = index.get(coin_key)
@@ -1704,9 +1707,13 @@ async def reconcile_on_startup() -> None:
         )
         return
 
-    hl_coins = {_bare(p["coin"]) for p in hl_positions if p.get("coin")}
+    # Normalize to the portal base coin so an HL k-symbol ('kPEPE') matches the
+    # DB's portal coin ('PEPE') — otherwise the k-coin gets wrongly "cleaned"
+    # from the DB and re-adopted under an unresolvable name (kPEPE incident).
+    hl_positions = [p for p in hl_positions if p.get("coin")]
+    hl_coins = {portal_base_coin(_bare(p["coin"])) for p in hl_positions}
     db_live = db.list_live_trades()
-    db_coins = {_bare(t["coin"]) for t in db_live if t.get("coin")}
+    db_coins = {portal_base_coin(_bare(t["coin"])) for t in db_live if t.get("coin")}
 
     only_hl = hl_coins - db_coins
     only_db = db_coins - hl_coins

@@ -256,16 +256,31 @@ def aliased_symbol(symbol: str) -> Optional[str]:
     return None
 
 
+def portal_base_coin(coin: str) -> str:
+    """Canonical PORTAL base coin, accepting EITHER the portal name ('PEPE') or
+    an HL k-symbol ('kPEPE'/'KPEPE'). Strips a leading 'k' when the remainder is
+    a known k-coin, else upper-cases.
+
+    Why this exists: startup adoption once stored the HL order name ('kPEPE') as
+    the trade's coin. Downstream, hl_symbol_for('kPEPE') upper-cased it to
+    'KPEPE' (not on any dex) and is_k_coin('kPEPE') was False — so EVERY SL/TP
+    op on that trade was rejected. Normalizing here makes the pipeline tolerant
+    of either name (the 2026-09-21 kPEPE incident)."""
+    s = (coin or "").strip()
+    if s[:1].lower() == "k" and s[1:].upper() in K_COINS:
+        return s[1:].upper()
+    return s.upper()
+
+
 def hl_symbol_for(portal_coin: str) -> str:
-    """Return HL symbol (with k-prefix for qualifying memecoins)."""
-    s = portal_coin.upper().strip()
-    if s in K_COINS:
-        return "k" + s
-    return s
+    """Return HL symbol (with k-prefix for qualifying memecoins). Accepts a
+    portal coin OR an already-k-prefixed HL symbol."""
+    base = portal_base_coin(portal_coin)
+    return "k" + base if base in K_COINS else base
 
 
 def is_k_coin(portal_coin: str) -> bool:
-    return portal_coin.upper().strip() in K_COINS
+    return portal_base_coin(portal_coin) in K_COINS
 
 
 # HL k-coins (kPEPE, kSHIB, …) are quoted per 1000 tokens, so HL_price is
