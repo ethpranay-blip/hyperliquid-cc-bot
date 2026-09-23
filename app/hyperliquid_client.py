@@ -256,32 +256,58 @@ def aliased_symbol(symbol: str) -> Optional[str]:
     return None
 
 
+def portal_base_coin(coin: str) -> str:
+    """Canonical PORTAL base coin, accepting EITHER the portal name ('PEPE') or
+    an HL k-symbol ('kPEPE'/'KPEPE'). Strips a leading 'k' when the remainder is
+    a known k-coin, else upper-cases.
+
+    Why this exists: startup adoption once stored the HL order name ('kPEPE') as
+    the trade's coin. Downstream, hl_symbol_for('kPEPE') upper-cased it to
+    'KPEPE' (not on any dex) and is_k_coin('kPEPE') was False — so EVERY SL/TP
+    op on that trade was rejected. Normalizing here makes the pipeline tolerant
+    of either name (the 2026-09-21 kPEPE incident)."""
+    s = (coin or "").strip()
+    if s[:1].lower() == "k" and s[1:].upper() in K_COINS:
+        return s[1:].upper()
+    return s.upper()
+
+
 def hl_symbol_for(portal_coin: str) -> str:
-    """Return HL symbol (with k-prefix for qualifying memecoins)."""
-    s = portal_coin.upper().strip()
-    if s in K_COINS:
-        return "k" + s
-    return s
+    """Return HL symbol (with k-prefix for qualifying memecoins). Accepts a
+    portal coin OR an already-k-prefixed HL symbol."""
+    base = portal_base_coin(portal_coin)
+    return "k" + base if base in K_COINS else base
 
 
 def is_k_coin(portal_coin: str) -> bool:
-    return portal_coin.upper().strip() in K_COINS
+    return portal_base_coin(portal_coin) in K_COINS
+
+
+# HL k-coins (kPEPE, kSHIB, …) are quoted per 1000 tokens, so HL_price is
+# ALWAYS 1000 × the caller's portal price. All entries in K_COINS use this.
+K_PRICE_MULT = 1000.0
 
 
 def scale_stop_for_k(
     portal_coin: str,
     portal_stop: Optional[float],
-    portal_entry: Optional[float],
-    hl_mid: Optional[float],
+    portal_entry: Optional[float] = None,   # kept for signature stability; unused
+    hl_mid: Optional[float] = None,         # kept for signature stability; unused
 ) -> Optional[float]:
-    """For k-coins, stop must be scaled: hl_stop = hl_mid * (portal_stop/portal_entry)."""
+    """Map a caller's PORTAL-space price into HL price space.
+
+    For k-coins this is an ABSOLUTE mapping: hl_price = portal_price × 1000.
+    The previous form — hl_mid × (portal_stop / portal_entry) — DRIFTED once
+    price moved away from entry (it re-anchored the stop to the *current* mid),
+    which silently corrupted every k-coin stop UPDATE. That's the 2026-09-21
+    kPEPE incident: Pranay's SL move mapped to ≈ the live mark and was rejected
+    as "would trigger immediately". Non-k-coins pass through unchanged.
+    """
     if portal_stop is None:
         return None
     if not is_k_coin(portal_coin):
         return portal_stop
-    if not portal_entry or not hl_mid or portal_entry <= 0 or hl_mid <= 0:
-        return portal_stop
-    return hl_mid * (portal_stop / portal_entry)
+    return float(portal_stop) * K_PRICE_MULT
 
 
 def _probe_available_dexs(

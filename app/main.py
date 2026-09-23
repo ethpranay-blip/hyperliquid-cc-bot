@@ -42,7 +42,7 @@ from app import db
 from app import notifier
 from app.hyperliquid_client import (
     HyperliquidClient, HyperliquidError, HyperliquidValidationError,
-    hl_symbol_for, is_k_coin, MIN_NOTIONAL_USD,
+    hl_symbol_for, is_k_coin, K_PRICE_MULT, MIN_NOTIONAL_USD, portal_base_coin,
 )
 from app.execution import (
     LevelSlippageExceeded, get_sl_slip_pct, get_tp_slip_pct,
@@ -613,10 +613,17 @@ async def handle_stop_update(event: dict) -> None:
     # Protect the MEMBER's breakeven, not the caller's (possibly-edited) entry.
     # After the first TP, a caller "breakeven" move to an entry they edited down
     # would put our stop below our own fill = a locked loss. Floor it at our fill.
-    fill = opened.get("my_fill_price") or opened.get("entry_price")
+    # new_stop is in PORTAL units, but our stored fill is in HL units — for
+    # k-coins those differ by 1000×, so convert the fill to portal units first
+    # (else the floor mangles the value → update rejected; the kPEPE incident).
+    fill_hl = opened.get("my_fill_price") or opened.get("entry_price")
+    fill_portal = None
+    if fill_hl:
+        fill_portal = (float(fill_hl) / K_PRICE_MULT
+                       if is_k_coin(coin) else float(fill_hl))
     applied_stop = member_breakeven_floor(
         caller_stop=float(new_stop),
-        fill_price=float(fill) if fill else None,
+        fill_price=fill_portal,
         is_long=side.lower() in ("long", "buy"),
         tp_hit=db.get_tp_update_count(int(trade_id)) >= 1,
     )
@@ -1616,10 +1623,13 @@ async def _adopt_untracked_positions(hl_positions: list[dict], only_hl: set) -> 
         log.exception("adopt: could not fetch activity feed — skipping adoption")
         return
 
-    index = build_open_trade_index(raw_events, lambda c: _bare(hl_symbol_for(c)))
+    # Key by the PORTAL base coin on both sides so an HL 'kPEPE' position maps to
+    # its 'PEPE' portal trade — and, crucially, gets STORED as 'PEPE' so every
+    # downstream SL/TP resolve works (the kPEPE incident stored 'kPEPE').
+    index = build_open_trade_index(raw_events, lambda c: portal_base_coin(_bare(c)))
     adopted = 0
     for p in hl_positions:
-        coin_key = _bare(p.get("coin") or "")
+        coin_key = portal_base_coin(_bare(p.get("coin") or ""))
         if coin_key not in only_hl:
             continue
         match = index.get(coin_key)
@@ -1697,9 +1707,13 @@ async def reconcile_on_startup() -> None:
         )
         return
 
-    hl_coins = {_bare(p["coin"]) for p in hl_positions if p.get("coin")}
+    # Normalize to the portal base coin so an HL k-symbol ('kPEPE') matches the
+    # DB's portal coin ('PEPE') — otherwise the k-coin gets wrongly "cleaned"
+    # from the DB and re-adopted under an unresolvable name (kPEPE incident).
+    hl_positions = [p for p in hl_positions if p.get("coin")]
+    hl_coins = {portal_base_coin(_bare(p["coin"])) for p in hl_positions}
     db_live = db.list_live_trades()
-    db_coins = {_bare(t["coin"]) for t in db_live if t.get("coin")}
+    db_coins = {portal_base_coin(_bare(t["coin"])) for t in db_live if t.get("coin")}
 
     only_hl = hl_coins - db_coins
     only_db = db_coins - hl_coins
