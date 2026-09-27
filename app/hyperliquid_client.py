@@ -1480,10 +1480,18 @@ class HyperliquidClient:
         """
         if not preplace_tps_enabled() or not take_profits:
             return 0
+
+        # The caller's TP prices are in PORTAL units. For k-coins those are a
+        # different scale than HL (kPEPE = 1000× PEPE), so run the WHOLE plan in
+        # portal units — convert the HL reference price down — then scale each
+        # leg back up to HL when building the order (same as the SL does via
+        # scale_stop_for_k). Non-k-coins are a no-op (mult = 1, passthrough).
+        ref_portal = (ref_price / K_PRICE_MULT) if (is_k_coin(order_name) and ref_price) else ref_price
+
         if self.dry_run:
             # Nothing rests on HL, but report what WOULD be placed for tracking.
             return len(plan_tp_legs(
-                position_size=1.0, tps=take_profits, ref_price=ref_price,
+                position_size=1.0, tps=take_profits, ref_price=ref_portal,
                 is_long=is_buy, band_pct=get_tp_band_pct(),
             ))
         if self._exchange is None:
@@ -1505,7 +1513,7 @@ class HyperliquidClient:
             return 0
 
         legs = plan_tp_legs(
-            position_size=float(pos_size), tps=take_profits, ref_price=ref_price,
+            position_size=float(pos_size), tps=take_profits, ref_price=ref_portal,
             is_long=is_buy, band_pct=get_tp_band_pct(),
         )
         orders: list[dict] = []
@@ -1516,11 +1524,15 @@ class HyperliquidClient:
                 continue
             cl = tp_cloid_for(trade_id, idx)
             cloids.append(cl)
+            # scale_stop_for_k maps a PORTAL price into HL space (×1000 for
+            # k-coins, passthrough otherwise) — reused here for the TP prices.
+            trigger_hl = round_px(scale_stop_for_k(order_name, leg["trigger_px"]), sz_dec)
+            limit_hl = round_px(scale_stop_for_k(order_name, leg["limit_px"]), sz_dec)
             orders.append({
                 "coin": order_name, "is_buy": (not is_buy), "sz": sz,
-                "limit_px": round_px(leg["limit_px"], sz_dec),
+                "limit_px": limit_hl,
                 "order_type": {"trigger": {
-                    "triggerPx": round_px(leg["trigger_px"], sz_dec),
+                    "triggerPx": trigger_hl,
                     "isMarket": False, "tpsl": "tp",
                 }},
                 "reduce_only": True, "cloid": cl,
@@ -1547,9 +1559,10 @@ class HyperliquidClient:
             return 0
         self._tp_cloids[trade_id] = cloids
         log.info(
-            "TP ladder #%s %s: placed %d TP(s) %s",
+            "TP ladder #%s %s: placed %d TP(s) at HL %s",
             trade_id, order_name, len(orders),
-            [round_px(l["trigger_px"], sz_dec) for l in legs[:len(orders)]],
+            [round_px(scale_stop_for_k(order_name, l["trigger_px"]), sz_dec)
+             for l in legs[:len(orders)]],
         )
         return len(orders)
 
