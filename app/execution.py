@@ -73,6 +73,31 @@ def get_default_slip_pct() -> float:
     return get_entry_slip_pct()
 
 
+def stop_verdict(
+    *,
+    caller_stop_hl: Optional[float],
+    our_stop_hl: Optional[float],
+    tol_pct: float,
+) -> tuple[bool, str]:
+    """Compare our resting HL stop to the caller's current stop (BOTH in HL price
+    space — scale the caller's portal stop with scale_stop_for_k first).
+
+    Returns (ok, reason). Not-ok means the stop-health monitor should alert:
+      - no resting stop on HL at all  → unprotected (always flagged)
+      - our stop drifted > tol_pct from the caller's current stop
+    A caller with no known stop is NOT a failure as long as we still hold one.
+    """
+    if our_stop_hl is None:
+        return False, "no resting stop on HL"
+    if caller_stop_hl is None or caller_stop_hl <= 0:
+        return True, "in sync (caller stop unknown)"
+    drift = abs(our_stop_hl - caller_stop_hl) / caller_stop_hl
+    if drift <= tol_pct:
+        return True, "in sync"
+    return False, (f"drift {drift*100:.1f}% — caller→HL {caller_stop_hl:g} "
+                   f"vs ours {our_stop_hl:g}")
+
+
 def get_tp_band_pct() -> float:
     """Protective-limit band for PRE-PLACED TP trigger orders. Default 0.5% —
     the caller wants TPs filled within 0.5% of their posted TP price."""
