@@ -1829,22 +1829,12 @@ async def _run_stop_health_check() -> None:
         _report_stop_health({})
         return
 
-    # Caller stops in ONE portal read (current trade objects carry `stop`).
-    caller: dict[int, float] = {}
+    # Caller stops in ONE read, via the shape-tolerant parser the bot already
+    # uses in production (handles nested-or-flat trade objects).
     try:
-        for w in (await state.portal.get_trades()) or []:
-            if not isinstance(w, dict):
-                continue
-            t = w.get("trade") if isinstance(w.get("trade"), dict) else {}
-            tid = w.get("tradeId") or t.get("tradeId")
-            s = t.get("stop")
-            if tid is not None and s not in (None, "", 0):
-                try:
-                    caller[int(tid)] = float(s)
-                except (TypeError, ValueError):
-                    pass
+        caller = await state.portal.list_trade_stops()
     except Exception:
-        log.exception("stop-health: portal get_trades failed — skipping this tick")
+        log.exception("stop-health: portal read failed — skipping this tick")
         return
 
     sl_by_coin = _sl_px_by_coin(await state.hl.list_open_orders())
