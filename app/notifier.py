@@ -445,6 +445,21 @@ class Notifier:
         lines.append(f"• {_utcnow()}")
         self._dispatch("\n".join(lines))
 
+    def notify_stop_health(self, *, issues: list) -> None:
+        """Alert that one or more live trades' stops are out of sync with the
+        caller (drifted) or missing on HL. `issues` = [(trade_id, message)].
+        Only NEW/changed issues are passed in (the monitor dedups), so this
+        won't spam every interval."""
+        if not self.enabled or not issues:
+            return
+        lines = ["🛑 STOP CHECK — needs attention", ""]
+        for tid, msg in issues:
+            lines.append(f"• #{tid}  {msg}")
+        lines.append("")
+        lines.append("Set/re-check these stops on HL.")
+        lines.append(f"• {_utcnow()}")
+        self._dispatch("\n".join(lines))
+
     def notify_heartbeat(
         self,
         *,
@@ -543,6 +558,10 @@ def notify_resting(**kwargs) -> None:
 
 def notify_entry_edited(**kwargs) -> None:
     _default.notify_entry_edited(**kwargs)
+
+
+def notify_stop_health(**kwargs) -> None:
+    _default.notify_stop_health(**kwargs)
 
 
 def reload_from_env() -> None:

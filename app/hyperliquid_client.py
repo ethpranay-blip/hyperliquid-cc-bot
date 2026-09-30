@@ -1976,6 +1976,22 @@ class HyperliquidClient:
                     return None
         return None
 
+    async def list_open_orders(self) -> list:
+        """All resting orders for our wallet (one frontend_open_orders call).
+        Read-only; used by the stop-health monitor. [] on failure."""
+        if self._info is None or not self.main_address:
+            return []
+        def _call():
+            try:
+                return self._info.frontend_open_orders(self.main_address)
+            except Exception:
+                return []
+        try:
+            orders = await asyncio.to_thread(_call)
+        except Exception:
+            return []
+        return orders if isinstance(orders, list) else []
+
     async def get_resting_stop_price(self, order_name: str) -> Optional[float]:
         """Best-effort: triggerPx of a resting reduce-only stop for `order_name`.
 

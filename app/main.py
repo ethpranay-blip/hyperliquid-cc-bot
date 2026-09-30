@@ -43,9 +43,10 @@ from app import notifier
 from app.hyperliquid_client import (
     HyperliquidClient, HyperliquidError, HyperliquidValidationError,
     hl_symbol_for, is_k_coin, K_PRICE_MULT, MIN_NOTIONAL_USD, portal_base_coin,
+    scale_stop_for_k, _is_tp_cloid_raw,
 )
 from app.execution import (
-    LevelSlippageExceeded, get_sl_slip_pct, get_tp_slip_pct,
+    LevelSlippageExceeded, get_sl_slip_pct, get_tp_slip_pct, stop_verdict,
 )
 from app.performance import (
     reconcile as _perf_reconcile,
@@ -114,6 +115,11 @@ class AppState:
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.reconcile_task: Optional[asyncio.Task] = None
         self.hl_change_task: Optional[asyncio.Task] = None
+        self.stop_health_task: Optional[asyncio.Task] = None
+        # {trade_id: issue message} for live trades whose HL stop is missing or
+        # drifted from the caller's current stop. Surfaced on the dashboard +
+        # Telegram-alerted on change (never every tick). Empty = all in sync.
+        self.stop_health: dict[int, str] = {}
         # Trade IDs the user has explicitly approved for entry even though
         # they're STALE (older than startup-time cutoff). Loaded from
         # FORCE_ENTER_TIDS env at startup; can be appended to at runtime.
@@ -1785,6 +1791,115 @@ RECONCILE_INTERVAL_S = float(os.environ.get("RECONCILE_INTERVAL_SECONDS", 60))
 PENDING_DRAIN_INTERVAL_S = float(os.environ.get("PENDING_DRAIN_INTERVAL_SECONDS", 60))
 
 
+STOP_HEALTH_INTERVAL_S = float(os.environ.get("STOP_HEALTH_INTERVAL_SECONDS", 600))
+STOP_HEALTH_DRIFT_PCT = float(os.environ.get("STOP_HEALTH_DRIFT_PCT", "0.5")) / 100.0
+
+
+def _sl_px_by_coin(orders: list) -> dict:
+    """{portal_base_coin: resting SL triggerPx (HL units)} from open orders —
+    reduce-only triggers only, with our pre-placed TP legs excluded."""
+    out: dict[str, float] = {}
+    for o in orders or []:
+        if not isinstance(o, dict) or not o.get("reduceOnly"):
+            continue
+        otype = str(o.get("orderType") or "").lower()
+        if not (o.get("isTrigger") or "stop" in otype or "trigger" in otype):
+            continue
+        if _is_tp_cloid_raw(o.get("cloid")):
+            continue                                   # a TP leg, not the stop
+        if str(o.get("tpsl") or "").lower().startswith("tp"):
+            continue
+        try:
+            px = float(o.get("triggerPx"))
+        except (TypeError, ValueError):
+            continue
+        key = portal_base_coin(_bare(o.get("coin") or ""))
+        out.setdefault(key, px)                        # first (place-before-cancel → one)
+    return out
+
+
+async def _run_stop_health_check() -> None:
+    """Compare every live trade's HL stop to the caller's CURRENT portal stop;
+    record + alert on drift or a missing stop. Read-only — never touches orders.
+    This is what turns a SILENT stop failure (the kPEPE class) into a loud ping."""
+    if state.hl is None or state.portal is None or state.dry_run:
+        return
+    live = db.list_live_trades()
+    if not live:
+        _report_stop_health({})
+        return
+
+    # Caller stops in ONE portal read (current trade objects carry `stop`).
+    caller: dict[int, float] = {}
+    try:
+        for w in (await state.portal.get_trades()) or []:
+            if not isinstance(w, dict):
+                continue
+            t = w.get("trade") if isinstance(w.get("trade"), dict) else {}
+            tid = w.get("tradeId") or t.get("tradeId")
+            s = t.get("stop")
+            if tid is not None and s not in (None, "", 0):
+                try:
+                    caller[int(tid)] = float(s)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        log.exception("stop-health: portal get_trades failed — skipping this tick")
+        return
+
+    sl_by_coin = _sl_px_by_coin(await state.hl.list_open_orders())
+    issues: dict[int, str] = {}
+    for t in live:
+        tid = int(t["trade_id"])
+        coin = portal_base_coin(t.get("coin") or "")
+        ours = sl_by_coin.get(coin)
+        cs = caller.get(tid)
+        cs_hl = scale_stop_for_k(coin, cs) if cs is not None else None
+        ok, reason = stop_verdict(
+            caller_stop_hl=cs_hl, our_stop_hl=ours, tol_pct=STOP_HEALTH_DRIFT_PCT,
+        )
+        if not ok:
+            issues[tid] = f"{coin} — {reason}"
+    _report_stop_health(issues)
+
+
+def _report_stop_health(issues: dict) -> None:
+    """Dedup + surface. Alert (Telegram + feed) only on NEW/changed issues, so a
+    standing drift doesn't re-ping every 10 min. Clears resolved ones quietly."""
+    prev = state.stop_health
+    state.stop_health = issues
+    new = [(tid, msg) for tid, msg in issues.items() if prev.get(tid) != msg]
+    for tid, msg in new:
+        log.warning("STOP HEALTH: #%s %s", tid, msg)
+        _push_activity("blocked", f"🛑 STOP {msg} #{tid}", tid)
+    for tid in prev:
+        if tid not in issues:
+            log.info("STOP HEALTH: #%s back in sync", tid)
+    if new:
+        notifier.notify_stop_health(issues=new)
+    if issues != prev:
+        state.fire_refresh()
+
+
+async def stop_health_loop() -> None:
+    """Every STOP_HEALTH_INTERVAL_S, run the stop-health check. Silence means all
+    live stops match the callers'; a Telegram ping means one has drifted or gone
+    missing — the confirmation the operator asked for."""
+    if state.dry_run:
+        return
+    log.info("stop-health monitor active (interval=%.0fs, tol=%.2f%%)",
+             STOP_HEALTH_INTERVAL_S, STOP_HEALTH_DRIFT_PCT * 100)
+    while True:
+        try:
+            await asyncio.sleep(STOP_HEALTH_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+        try:
+            await _run_stop_health_check()
+        except Exception:
+            log.exception("stop-health check failed (will retry next tick)")
+
+
 async def periodic_reconcile_loop() -> None:
     """Background task: re-runs reconcile_on_startup() every 5 minutes.
 
@@ -1979,6 +2094,11 @@ async def on_startup() -> None:
     state.hl_change_task = asyncio.create_task(
         hl_change_reconciler(), name="hl-change-reconciler"
     )
+    # Continuously confirms our HL stops match the callers' current stops;
+    # Telegram-alerts on drift or a missing stop (silence = all in sync).
+    state.stop_health_task = asyncio.create_task(
+        stop_health_loop(), name="stop-health"
+    )
 
     log.info(
         "ready — dry_run=%s testnet=%s auto_mode=%s",
@@ -2001,6 +2121,7 @@ async def on_shutdown() -> None:
         ("heartbeat_task", state.heartbeat_task),
         ("reconcile_task", state.reconcile_task),
         ("hl_change_task", state.hl_change_task),
+        ("stop_health_task", state.stop_health_task),
     ):
         if task is None:
             continue
@@ -2199,6 +2320,22 @@ def index() -> None:
             def render_cards() -> None:
                 cards_container.clear()
                 with cards_container:
+                    # Stop-health banner: loud, persistent flag when a live
+                    # trade's HL stop has drifted from the caller or gone
+                    # missing. Empty = every stop is in sync.
+                    if state.stop_health:
+                        with ui.element("div").classes("w-full rounded-lg p-3").style(
+                            "background:#3b1219;border:1px solid #7f1d1d"
+                        ):
+                            ui.label(
+                                f"🛑 {len(state.stop_health)} stop(s) out of sync "
+                                "— check on HL"
+                            ).classes("text-red-300 font-semibold text-sm")
+                            for _tid, _msg in state.stop_health.items():
+                                ui.label(f"#{_tid}  {_msg}").classes(
+                                    "text-red-200 text-xs"
+                                )
+
                     live = db.list_live_trades()
                     live_ids = {int(t["trade_id"]) for t in live}
 
