@@ -386,6 +386,29 @@ class PortalClient:
             if isinstance(t, dict)
         ]
 
+    async def list_trade_stops(self) -> dict:
+        """{trade_id: current caller stop (portal price)} for all followed trades.
+
+        Read-only. Uses the SAME shape-tolerant parsing as get_trade_detail's
+        fallback — the trade fields may be nested under `trade` or flat at the
+        top level, and the id may be `tradeId` or `trade.id`. Used by the
+        stop-health monitor and stop_audit.py."""
+        out: dict[int, float] = {}
+        try:
+            trades = await self.get_trades()
+        except Exception as exc:
+            log.warning("list_trade_stops: get_trades failed: %s", exc)
+            return out
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            inner = t.get("trade") if isinstance(t.get("trade"), dict) else t
+            tid = _int(t.get("tradeId") or t.get("trade_id") or inner.get("id"))
+            stop = _num(inner.get("stop") or inner.get("stopLoss"))
+            if tid is not None and stop is not None and stop > 0:
+                out[tid] = stop
+        return out
+
     async def follow_trade(self, trade_id: int) -> dict:
         resp = await self._request(
             "POST", "/api/portal/me/trades", json={"tradeId": int(trade_id)},
