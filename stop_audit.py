@@ -83,20 +83,11 @@ async def main() -> None:
     portal = PortalClient()
     await portal.start()
 
-    # Caller stops: one GET of all followed trades → {trade_id: stop(portal)}
-    caller_stop: dict[int, float] = {}
+    # Caller stops: {trade_id: stop(portal)} via the shape-tolerant helper.
     try:
-        for w in (await portal.get_trades()) or []:
-            t = w.get("trade") if isinstance(w, dict) else None
-            tid = (w or {}).get("tradeId") or (t or {}).get("tradeId")
-            s = (t or {}).get("stop") if isinstance(t, dict) else None
-            if tid is not None and s not in (None, "", 0):
-                try:
-                    caller_stop[int(tid)] = float(s)
-                except (TypeError, ValueError):
-                    pass
+        caller_stop = await portal.list_trade_stops()
     except Exception as e:
-        print(f"portal get_trades failed: {e}")
+        print(f"portal read failed: {e}"); caller_stop = {}
 
     orders = _hl_open_orders()
     live = db.list_live_trades()
